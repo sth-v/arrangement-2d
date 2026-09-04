@@ -8,6 +8,15 @@
 // (arr2d::segment, arr2d::linear, ...). All of them take/return Geom boxes.
 //
 // Conventions
+//   * Every output vector parameter (`out`, `numbers`, `left/right` excepted) is CLEARED first, then filled
+//     (this includes make_x_monotone and intersect).
+//   * Constructors and convert_curve return XCurve boxes whenever the result is x-monotone by
+//     construction (segments, linear objects, polyline sub-pieces, ...); general curves are Curve boxes.
+//   * Kind-specific accessors that return sub-objects of another kind (polyline::point / ::subcurve
+//     return Kind::Segment boxes) must be converted with convert_point / convert_curve before being
+//     passed to another kind's KindOps.
+//   * approximate_coordinate agrees with point_approx (both correctly rounded) — it does NOT expose
+//     CGAL's raw Approximate_2, which is not correctly rounded for Epeck-based traits.
 //   * Comparison results are ints: -1 (SMALLER/CLOCKWISE/NEGATIVE), 0 (EQUAL), +1 (LARGER/CCW/POSITIVE).
 //   * Points passed to a kind must have that kind (use convert_point first); Error(KindMismatch) otherwise.
 //   * Functions that need an x-monotone curve throw Error(NotXMonotone) if given a general Curve.
@@ -164,8 +173,8 @@ Geom make_full_circle_r(const Rational& cx, const Rational& cy, const Rational& 
 /// Arc of the circle (cx,cy,r^2) from source to target in the given orientation. Endpoints must lie on the circle (CircleSegment-kind points, may have sqrt coordinates).
 Geom make_arc(const Rational& cx, const Rational& cy, const Rational& squared_radius, int orientation, const Geom& source, const Geom& target);
 Geom make_arc_r(const Rational& cx, const Rational& cy, const Rational& radius, int orientation, const Geom& source, const Geom& target);
-bool has_rational_radius(const Geom& c);                       ///< true if the curve was built with an explicit rational radius
-Rational radius(const Geom& c);                                ///< only if has_rational_radius
+bool has_rational_radius(const Geom& c);                       ///< always false in CGAL 6.1: _Circle_segment_2 keeps its radius flag protected (no accessor)
+Rational radius(const Geom& c);                                ///< Unsupported in CGAL 6.1 (see has_rational_radius); use squared_radius
 /// Arc through three rational points (source, mid, target).
 Geom make_arc_three_points(const Geom& p, const Geom& q, const Geom& r);
 /// Line segment (as a circle-segment curve).
@@ -199,7 +208,7 @@ void control_point(const Geom& c, std::size_t i, Rational& x, Rational& y);
 std::size_t curve_id(const Geom& c);                           ///< CGAL's serial id of the supporting curve
 Geom supporting_curve(const Geom& xc);                          ///< XCurve -> Curve
 unsigned xid(const Geom& xc);                                  ///< index of the x-monotone piece within its supporting curve
-void parameter_range(const Geom& xc, double& t_min, double& t_max);   ///< approximate parameter interval of an x-monotone piece
+void parameter_range(const Geom& xc, double& t_min, double& t_max);   ///< ORDERED (t_min <= t_max) parameter interval of an x-monotone piece, from the exact endpoint parameters; direction via xcurve_source/target
 /// Evaluate the supporting curve at a rational parameter: exact Bezier point (carrying the originator).
 Geom point_at(const Geom& c, const Rational& t);
 /// Evaluate approximately (doubles) at t in [0,1]; works on Curve or XCurve (supporting curve).

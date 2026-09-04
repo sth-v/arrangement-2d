@@ -17,9 +17,9 @@
 namespace arr2d {
 
 struct PolygonGeom {
-  std::vector<Geom> outer;                 ///< empty + unbounded==true means "the whole plane minus holes"
+  std::vector<Geom> outer;                 ///< EMPTY outer == unbounded polygon ("the whole plane minus holes"), matching CGAL's representation
   std::vector<std::vector<Geom>> holes;
-  bool unbounded = false;
+  bool unbounded = false;                  ///< informational; must not be true when outer is non-empty
 };
 
 class PolygonSetBase {
@@ -32,10 +32,10 @@ class PolygonSetBase {
   // ---- validation helpers (do not throw on invalid input) ----
   virtual int orientation(const std::vector<Geom>& boundary) const = 0;      ///< +1 ccw, -1 cw, 0 degenerate/not closed
   virtual bool is_valid_polygon(const PolygonGeom& p) const = 0;              ///< CGAL's is_valid_polygon / is_valid_polygon_with_holes
-  virtual bool is_closed_chain(const std::vector<Geom>& boundary) const = 0;  ///< consecutive curves connect and the chain closes
+  virtual bool is_closed_chain(const std::vector<Geom>& boundary) const = 0;  ///< consecutive curves connect and the chain closes (CGAL semantics: an empty chain is vacuously closed, a single-curve chain is not)
 
   // ---- construction ----
-  virtual void insert(const PolygonGeom& p) = 0;                ///< precondition: valid & disjoint from current content (CGAL semantics); throws Precondition error otherwise
+  virtual void insert(const PolygonGeom& p) = 0;                ///< validated first (CGAL is_valid_polygon*): throws Error(InvalidArgument) naming the defect; disjointness from the current content remains a CGAL precondition (use join_polygon for overlapping input)
   virtual void insert_polygons(const std::vector<PolygonGeom>& ps) = 0;   ///< range insertion (polygons may not overlap each other)
 
   // ---- Boolean operations (in place) ----

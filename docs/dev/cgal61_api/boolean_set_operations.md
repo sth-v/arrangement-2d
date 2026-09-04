@@ -1107,10 +1107,10 @@ Precondition documented on `Construct_polygon_with_holes_2` (verbatim):
 | --- | --- | --- | --- |
 | `Arr_segment_traits_2` | ✔ | ✔ | ✔ (but prefer `Gps_segment_traits_2` for `CGAL::Polygon_2` input) |
 | `Arr_non_caching_segment_traits_2` | ✔ | ✔ | ✔ |
-| `Arr_polyline_traits_2` / `Arr_polycurve_traits_2` / `…_basic_…` | ✔ | ✔ | ✔ — this is what the `Tag_true` free-function path uses |
+| `Arr_polyline_traits_2` / `Arr_polycurve_traits_2` / `…_basic_…` | ✔ | ✔ | ✔ — this is what the `Tag_true` free-function path uses — **amended in §22.0 / §22.4: `Arr_polycurve_traits_2<Arr_circle_segment_traits_2<K>>` verified working, but the set's `operator=` SIGSEGVs** |
 | `Arr_circle_segment_traits_2` | ✔ | ✔ | ✔ — wrapped as `Gps_circle_segment_traits_2` *(verified: join of two circles → 1 p-w-h, 4 x-monotone curves)* |
-| `Arr_conic_traits_2<RatKernel, AlgKernel, NtTraits>` | ✔ | ✔ | ✔ *(verified: `General_polygon_set_2<Gps_traits_2<Arr_conic_traits_2<…>>>` instantiates and compiles with CORE)* |
-| `Arr_Bezier_curve_traits_2<RatK, AlgK, NtTraits, BoundingTraits>` | ✔ | ✔ | ✔ (per header; not run here) |
+| `Arr_conic_traits_2<RatKernel, AlgKernel, NtTraits>` | ✔ | ✔ | ✔ *(verified: `General_polygon_set_2<Gps_traits_2<Arr_conic_traits_2<…>>>` instantiates and compiles with CORE)* — **amended in §22.0 / §22.3: verified end-to-end (join/intersection/difference run), but the set's `operator=` does NOT compile** |
+| `Arr_Bezier_curve_traits_2<RatK, AlgK, NtTraits, BoundingTraits>` | ✔ | ✔ | ~~✔ (per header; not run here)~~ → **✔ [verified] end-to-end in §22.2** — non-`const` `Construct_opposite_2::operator()` is harmless; but the traits copy shares the `Bezier_cache` without ownership and reusing a `General_polygon_2` across operations degrades catastrophically. **See §22.0 / §22.2.** |
 | `Arr_linear_traits_2` | ✔ | ✔ | ✔ formally, but unbounded curves cannot form a closed polygon boundary — only the bounded (segment) subset is useful |
 | `Arr_rational_function_traits_2`, `Arr_algebraic_segment_traits_2` | ✔ | ✔ | ✔ formally; same unboundedness caveat |
 | `Arr_geodesic_arc_on_sphere_traits_2` | ✔ | ✔ | ✔ but **only** via `Gps_on_surface_base_2` + `Arr_spherical_topology_traits_2` (§20) |
@@ -1891,3 +1891,982 @@ Caveats, all confirmed or read directly:
   `General_polygon_set_2` members (or the `s_*`/`r_*` helpers in `Bso_internal_functions.h`) so you
   control traits selection, the `k` parameter and the `Tag_true`/`Tag_false` polyline decision
   explicitly — and so you can implement a correct range `do_intersect`.
+
+---
+
+## 22. Boolean set operations on **curved** general polygons — Bézier, conic, polycurve-of-arcs
+
+*Everything in this section was compiled **and run** on the installed CGAL 6.1 headers with*
+`clang++ -std=c++17 -O0 -DCGAL_USE_CORE -DCGAL_USE_GMP -DCGAL_USE_MPFR -I/opt/homebrew/include -L/opt/homebrew/lib -lgmp -lmpfr`.
+*Numbers below are actual program output, marked **[verified]**.*
+
+### 22.0 Correction to the §11 table "Which arrangement traits qualify?"
+
+Three rows of the §11 table must be amended:
+
+| §11 row | old claim | **amended claim** |
+| --- | --- | --- |
+| `Arr_Bezier_curve_traits_2` | "✔ (per header; **not run here**)" | **✔ [verified] — `General_polygon_set_2<Gps_traits_2<Arr_Bezier_curve_traits_2<…>>>` instantiates, and `join`/`intersection`/`difference`/`symmetric_difference`/`complement`/`do_intersect` all run and produce correct results.** The non-`const` `Construct_opposite_2::operator()` is **not** a problem (§22.1). BUT: two hard lifetime rules and one pathological performance trap apply — see §22.2.4 and §22.2.5. |
+| `Arr_conic_traits_2` | "✔ (instantiates and compiles with CORE)" | **✔ [verified] end-to-end** — ellipse∪ellipse, ellipse∩rect-of-special-segments, etc., all run (§22.3.3). **New defect: `General_polygon_set_2<Gps_traits_2<Arr_conic_traits_2<…>>>::operator=` does NOT compile** (§22.3.4). |
+| `Arr_polycurve_traits_2` (generic row `Arr_polyline_traits_2 / Arr_polycurve_traits_2 / …_basic_…`) | "✔ — this is what the `Tag_true` free-function path uses" | ✔ for `Arr_polyline_traits_2<Arr_segment_traits_2<K>>`, and **✔ [verified] for `Arr_polycurve_traits_2<Arr_circle_segment_traits_2<K>>` (rounded rectangles)** — but **`…::operator=` compiles and then SEGFAULTS** because `Arr_polycurve_basic_traits_2`'s implicitly-generated copy-assignment double-owns the subcurve-traits pointer (§22.4.4). Never assign such a set. |
+
+Two facts that apply to **all** traits and were not stated anywhere in this file before:
+
+* **[verified] The copy of a `General_polygon_set_2` has an arrangement that points at the *source's*
+  traits object, not at its own.** Pointer identity confirmed for Bézier, conic and polycurve.
+  Destroying the source and then using the copy is undefined behaviour and **crashes for Bézier**
+  (SIGSEGV, §22.2.4).
+* **[verified] `CORE::BigRat` is `boost::multiprecision::mpq_rational` in CGAL 6.1**
+  (`CGAL/CORE/BigRat.h:32: typedef boost::multiprecision::mpq_rational BigRat;`), *not* the legacy
+  hand-written CORE rational. `CORE_algebraic_number_traits::Rational` is therefore
+  `boost::multiprecision::mpq_rational` and `::Algebraic` is `CORE::Expr`. Compiler diagnostics for
+  the conic/Bézier traits print the boost type; don't be confused by it.
+
+---
+
+### 22.1 What `Gps_on_surface_base_2` actually requires from `Traits_2` — and why non-`const` `Construct_opposite_2` is harmless
+
+`Gps_on_surface_base_2` stores
+
+```cpp
+  const Traits_2* m_traits;
+  CGAL::Arr_traits_adaptor_2<Traits_2>       m_traits_adaptor;
+  bool                                       m_traits_owner;
+  Aos_2*        m_arr;
+```
+
+and the only two uses of the directional functors are
+
+```cpp
+  // Gps_on_surface_base_2.h:1318  (_complement)
+    Construct_opposite_2 ctr_opp = m_traits->construct_opposite_2_object();
+    …
+      arr->modify_edge(he, ctr_opp(cv));
+
+  // Gps_on_surface_base_2.h:1335  (_fix_curves_direction)
+    Construct_opposite_2 ctr_opp =
+      arr.geometry_traits()->construct_opposite_2_object();
+```
+
+plus `Gps_bfs_xor_visitor.h:72` `Construct_opposite_2 ctr_opp = tr.construct_opposite_2_object();`
+and `General_polygon_2::reverse_orientation()`.
+
+**In every one of these places the functor is copied into a *non-const local*.** Therefore only
+`construct_opposite_2_object()` itself has to be `const` (it is, in all three traits), while
+`Construct_opposite_2::operator()` may be non-`const`. Verbatim from
+`Arr_Bezier_curve_traits_2.h:813-832`:
+
+```cpp
+  class Construct_opposite_2
+  {
+  public:
+    X_monotone_curve_2 operator() (const X_monotone_curve_2& cv)      // *** NON-const ***
+    { return (cv.flip()); }
+  };
+
+  Construct_opposite_2 construct_opposite_2_object() const            // const
+  { return Construct_opposite_2(); }
+```
+
+**[verified]** gotcha 12 of `traits_bezier.md` (non-`const operator()`) does **not** block Boolean
+set operations. It *would* block `Gps_traits_decorator`, whose
+
+```cpp
+  // Gps_traits_decorator.h:519 / 529-531
+    Construct_opposite_2(Base_Construct_opposite_2& base) : m_base(base) {}   // non-const lvalue ref
+    …
+    Construct_opposite_2 construct_opposite_2_object() const
+    { return Construct_opposite_2(m_base_traits->construct_opposite_2_object()); }  // binds a PRVALUE
+```
+
+is ill-formed (binding a non-`const` lvalue reference to a temporary) — but the decorator's
+`construct_opposite_2_object()` is never instantiated on the `Gps_traits_2` path, so it never bites.
+Do not add a call to it in your own code.
+
+The full private requirement list (`Gps_on_surface_base_2.h:88-101`) is:
+
+```cpp
+  typedef typename Traits_2::Polygon_2                 Polygon_2;
+  typedef typename Traits_2::Polygon_with_holes_2      Polygon_with_holes_2;
+  typedef typename Traits_2::Point_2                   Point_2;
+  typedef typename Traits_2::X_monotone_curve_2        X_monotone_curve_2;
+  typedef typename Polygon_with_holes_2::Hole_const_iterator  GP_Holes_const_iterator;
+  typedef typename Traits_2::Curve_const_iterator      Curve_const_iterator;
+  typedef typename Traits_2::Compare_endpoints_xy_2    Compare_endpoints_xy_2;
+  typedef typename Traits_2::Construct_opposite_2      Construct_opposite_2;
+```
+
+`Gps_traits_2<ArrTraits_2>` supplies `Polygon_2` (= `General_polygon_2<ArrTraits_2>`),
+`Polygon_with_holes_2`, `Curve_const_iterator` (= `std::list<X_monotone_curve_2>::const_iterator`)
+and re-exports `Compare_endpoints_xy_2`; `Construct_opposite_2` is **inherited** from `ArrTraits_2`
+(`Gps_traits_2` does not re-typedef it, but public inheritance makes it visible). **No `Approximate_2`
+is required** by the Boolean layer — `General_polygon_2::approximate()` and `::bbox()` are templates
+that are only instantiated if you call them (`_Bezier_x_monotone_2` has neither, so **don't**).
+
+`Gps_traits_adaptor<Base>` (used by `General_polygon_2::orientation()`, `is_closed_polygon`,
+`has_valid_orientation_polygon*`) **copy-constructs the base traits**:
+
+```cpp
+  Gps_traits_adaptor() : Base() {}
+  Gps_traits_adaptor(const Base& traits) : Base (traits) {}
+```
+
+so its semantics follow the traits' own copy constructor (§22.2.4, §22.4.4).
+
+---
+
+### 22.2 A. Bézier — `Gps_traits_2<Arr_Bezier_curve_traits_2<…>>`  **[verified]**
+
+#### 22.2.1 Exact instantiation
+
+```cpp
+#include <CGAL/Cartesian.h>
+#include <CGAL/CORE_algebraic_number_traits.h>
+#include <CGAL/Arr_Bezier_curve_traits_2.h>
+#include <CGAL/Gps_traits_2.h>
+#include <CGAL/General_polygon_set_2.h>
+#include <CGAL/Boolean_set_operations_2.h>            // only for the free functions
+
+typedef CGAL::CORE_algebraic_number_traits              Nt_traits;
+typedef Nt_traits::Rational                             Rational;   // boost mpq_rational
+typedef Nt_traits::Algebraic                            Algebraic;  // CORE::Expr
+typedef CGAL::Cartesian<Rational>                       Rat_kernel;
+typedef CGAL::Cartesian<Algebraic>                      Alg_kernel;
+typedef CGAL::Arr_Bezier_curve_traits_2<Rat_kernel, Alg_kernel, Nt_traits>  Bez_traits;
+        //  4th template parameter defaults to
+        //  Bezier_bounding_rational_traits<Rat_kernel>
+typedef Bez_traits::Curve_2                             Bezier_curve_2;   // _Bezier_curve_2
+typedef Bez_traits::X_monotone_curve_2                  Bez_xcv;          // _Bezier_x_monotone_2
+typedef Bez_traits::Point_2                             Bez_point;        // _Bezier_point_2
+
+typedef CGAL::Gps_traits_2<Bez_traits>                  Gps_bez_traits;
+typedef Gps_bez_traits::Polygon_2                       Bez_polygon_2;    // General_polygon_2<Bez_traits>
+typedef Gps_bez_traits::Polygon_with_holes_2            Bez_pwh_2;
+typedef CGAL::General_polygon_set_2<Gps_bez_traits>     Bez_set_2;
+```
+
+**[verified] compiles cleanly** (no `-D` beyond the three above; no `-lCGAL_Core` — CORE is
+header-only in 6.1) and links to an 11 MB binary in ~3.5 s.
+
+#### 22.2.2 Construction recipe: closed Bézier general polygon
+
+`General_polygon_2` performs **zero** validation; you must produce a closed, consistently directed,
+counterclockwise chain of x-monotone curves yourself. There is no library helper.
+
+```cpp
+// 1. Build the boundary as a sequence of Bezier CURVES that already form a closed loop
+//    end-to-end, traversed in one direction.  Control points are Rat_kernel::Point_2.
+static Bezier_curve_2 cubic(int x0,int y0, int x1,int y1, int x2,int y2, int x3,int y3) {
+  std::vector<Rat_kernel::Point_2> cp = { {Rational(x0),Rational(y0)}, {Rational(x1),Rational(y1)},
+                                          {Rational(x2),Rational(y2)}, {Rational(x3),Rational(y3)} };
+  return Bezier_curve_2(cp.begin(), cp.end());        // template <class InputIterator> _Bezier_curve_2(b,e)
+}
+
+// 2. Split each curve into x-monotone subcurves and append them IN THE ORDER PRODUCED.
+static void split(const Bez_traits& tr, const Bezier_curve_2& B, std::list<Bez_xcv>& out) {
+  std::vector<std::variant<Bez_point, Bez_xcv>> objs;          // 6.x: std::variant, NOT CGAL::Object
+  tr.make_x_monotone_2_object()(B, std::back_inserter(objs));
+  for (const auto& o : objs)
+    if (const Bez_xcv* x = std::get_if<Bez_xcv>(&o)) out.push_back(*x);
+    // a std::get_if<Bez_point> result means an isolated point => your input was degenerate
+}
+
+// 3. Assemble, then normalise the orientation.
+Bez_polygon_2 make_pgn(const Bez_traits& tr) {
+  std::list<Bez_xcv> xs;
+  split(tr, cubic( 0, 0,  3,-3,  7,-3, 10, 0), xs);   // bottom, left -> right
+  split(tr, cubic(10, 0, 13, 3, 13, 7, 10,10), xs);   // right,  bottom -> top  (vertical tangency!)
+  split(tr, cubic(10,10,  7,13,  3,13,  0,10), xs);   // top,    right -> left
+  split(tr, cubic( 0,10, -3, 7, -3, 3,  0, 0), xs);   // left,   top -> bottom  (vertical tangency!)
+  Bez_polygon_2 p;
+  p.init(xs.begin(), xs.end());                        // init() CLEARS then inserts
+  CGAL::Gps_traits_adaptor<Bez_traits> adp(tr);        // share tr's Bezier_cache
+  if (adp.orientation_2_object()(p.curves_begin(), p.curves_end()) != CGAL::COUNTERCLOCKWISE)
+    p.reverse_orientation();
+  return p;
+}
+```
+
+Facts established by running this:
+
+* **[verified] `Make_x_monotone_2` preserves the direction of the input `Curve_2` and emits the
+  subcurves in increasing-parameter order.** The rounded square above yields `p.size() == 6`
+  (1 + 2 + 1 + 2 subcurves; the two side curves have a vertical tangency each) and
+  `is_closed_polygon` returns `1` with no re-ordering. A "lens" made from two cubics with monotone
+  control-point x yields `p.size() == 2`.
+* **[verified] `General_polygon_2::orientation()` and `::reverse_orientation()` both work for
+  Bézier**, even though they *default-construct a throw-away traits object*:
+
+  ```cpp
+  Orientation orientation() const
+  { Gps_traits_adaptor<Traits_2>  tr;                       // <-- FRESH, EMPTY Bezier_cache
+    return (tr.orientation_2_object()(m_xcurves.begin(), m_xcurves.end())); }
+
+  void reverse_orientation()
+  { m_xcurves.reverse();
+    Traits_2 tr;                                            // <-- FRESH, EMPTY Bezier_cache
+    typename Traits_2::Construct_opposite_2 ctr_opp = tr.construct_opposite_2_object();
+    for (Curve_iterator ci = m_xcurves.begin(); ci != m_xcurves.end(); ++ci)
+    { const X_monotone_curve_2& opp_cv = ctr_opp(*ci); *ci = opp_cv; } }
+  ```
+
+  Both allocate (and leak nothing, but discard) a whole `_Bezier_cache` + `Intersection_map` per
+  call. The answer agrees with the shared-cache adaptor **[verified]** (`CCW` vs `CCW`, `CW` vs
+  `CW`), so it is *correct* — just wasteful. **Prefer the explicit
+  `Gps_traits_adaptor<Bez_traits> adp(tr);` form in a binding.**
+* **[verified] The input `Curve_2` objects need NOT be kept alive.** `_Bezier_curve_2` derives from
+  `Handle_for<_Bezier_curve_2_rep<…>>` and `_Bezier_x_monotone_2` stores `Curve_2 _curve;` by value,
+  so the x-monotone curves keep the supporting curve's ref-counted rep alive. In the test the
+  `Bezier_curve_2` temporaries returned by `cubic()` were destroyed before any Boolean op ran.
+* `is_closed_polygon` (`Gps_polygon_validation.h:172`) additionally rejects a polygon with **exactly
+  one** curve (`if (next == end) return false; // A polygon cannot have just a single edge`) and any
+  curve whose two endpoints compare equal. Two curves are the minimum; `_insert` explicitly supports
+  it ("a polygon with circular arcs may have only two edges (full circle for example)").
+
+#### 22.2.3 Verified Boolean results
+
+Two "lens" polygons (2 x-monotone cubics each; A centred at x∈[0,10], B translated by (5,1)):
+
+| operation | result **[verified]** |
+| --- | --- |
+| `join` | 1 p-w-h, outer boundary 4 curves, 0 holes |
+| `intersection` | 1 p-w-h, outer 4 curves, 0 holes |
+| `difference` (A−B) | 1 p-w-h, outer 4 curves, 0 holes |
+| `symmetric_difference` | 1 p-w-h, outer 4 curves, **1 hole of 4 curves** |
+| `do_intersect(B)` (member, binary) | `1` |
+| `complement()` | 1 p-w-h, `is_unbounded()==1`, outer 0 curves, 1 hole of 2 curves |
+| `is_valid()` after each | `1` |
+
+Two rounded squares (6 x-monotone cubics each, incl. vertical tangencies; B translated by (6,3)):
+
+| operation | result **[verified]** |
+| --- | --- |
+| `join` | 1 p-w-h, outer **10** curves |
+| `intersection` | 1 p-w-h, outer **6** curves |
+| `difference` | 1 p-w-h, outer **8** curves |
+| `symmetric_difference` | 1 p-w-h, outer **10** curves + 1 hole of **6** curves |
+| `complement` | unbounded p-w-h, 1 hole of **6** curves |
+
+Free functions **[verified]** on the lens pair: `CGAL::join(p1,p2,res)` → `true`, `res` outer 4
+curves; `CGAL::intersection(p1,p2,oi)` → 1 p-w-h of 4 curves; `CGAL::difference` → 1;
+`CGAL::do_intersect(p1,p2)` → `1`; `CGAL::join(p1,p2,res,gps_traits)` (explicit-traits overload) →
+`true`.
+
+Timing on the rounded-square pair, **fresh polygons** (see the trap in §22.2.5):
+build 2 polygons 0.8 ms, orientation+normalise 0.2 ms, `General_polygon_set_2` ctor (incl. the
+`PreconditionValidationPolicy` sweep) 0.5 ms, `join` 2.5 ms, `polygons_with_holes` 0.03 ms,
+`is_valid()` 0.2 ms. **Bézier Booleans are not intrinsically slow.**
+
+#### 22.2.4 Ownership / lifetime — the two hard rules
+
+```cpp
+// Arr_Bezier_curve_traits_2.h:105-165  (verbatim)
+  mutable Bezier_cache * p_cache;
+  mutable Intersection_map * p_inter_map;
+  bool m_owner;
+
+  Arr_Bezier_curve_traits_2 ()
+  { p_cache = new Bezier_cache; p_inter_map = new Intersection_map; m_owner = true; }
+
+  Arr_Bezier_curve_traits_2 (const Self& tr) :
+    p_cache (tr.p_cache), p_inter_map (tr.p_inter_map), m_owner (false) {}   // SHALLOW, non-owning
+
+  Self& operator= (const Self& tr)
+  { if (this == &tr) return (*this);
+    p_cache = tr.p_cache; p_inter_map = tr.p_inter_map; m_owner = false; return (*this); }
+
+  ~Arr_Bezier_curve_traits_2 ()
+  { if (m_owner) { delete p_cache; delete p_inter_map; } p_cache = nullptr; p_inter_map = nullptr; }
+```
+
+Combine with `Gps_on_surface_base_2` (verbatim):
+
+```cpp
+  Gps_on_surface_base_2() : m_traits(new Traits_2()), m_traits_adaptor(*m_traits),
+                            m_traits_owner(true), m_arr(new Aos_2(m_traits)) {}
+  Gps_on_surface_base_2(const Traits_2& tr) : m_traits(&tr), … m_traits_owner(false), … {}
+  Gps_on_surface_base_2(const Self& ps) :
+    m_traits(new Traits_2(*(ps.m_traits))), m_traits_adaptor(*m_traits),
+    m_traits_owner(true), m_arr(new Aos_2(*(ps.m_arr))) {}
+```
+
+and with `Arrangement_on_surface_2::assign` (`Arrangement_on_surface_2_impl.h:201-202`, verbatim):
+
+```cpp
+  m_geom_traits = (arr.m_own_traits) ? new Traits_adaptor_2 : arr.m_geom_traits;
+  m_own_traits = arr.m_own_traits;
+```
+
+Consequences:
+
+1. **Who owns the `Bezier_cache`?** The *first* default-constructed `Bez_traits`. A
+   `General_polygon_set_2` built with the default constructor / `Set(pgn)` allocates
+   `new Traits_2()` and owns the cache. **A copy of that set gets `new Traits_2(*ps.m_traits)`,
+   i.e. a traits object that SHARES the cache with `m_owner == false`.** The copy therefore
+   *does not extend the cache's lifetime*.
+2. **The copy's arrangement aliases the SOURCE's traits object.** Because
+   `Gps_on_surface_base_2` builds `m_arr` with `new Aos_2(m_traits)` (→ `m_own_traits == false` in
+   the arrangement), the copy's `assign()` takes the `else` branch and stores *the source set's*
+   traits pointer. **[verified]** for Bézier, conic and polycurve:
+   `A.arrangement().geometry_traits() == B.arrangement().geometry_traits()` after `Bez_set_2 B(A);`.
+3. **[verified] ⇒ destroying the source set and then using the copy CRASHES.**
+   ```cpp
+   Bez_set_2* A = new Bez_set_2(p1); A->join(p2);
+   Bez_set_2 B(*A);
+   delete A;                      // frees A->m_traits  ⇒  frees the Bezier_cache AND the object
+   B.intersection(p1);            // *** SIGSEGV (exit 139) ***
+   ```
+   The crash reproduces both with and without `MallocScribble=1`.
+4. `Bez_set_2::operator=` **does** compile and run (Bézier traits has a user-defined `operator=`),
+   and it leaves `C.arrangement().geometry_traits() == A.arrangement().geometry_traits()`
+   **[verified]** — same aliasing hazard.
+
+**Binding rules for Bézier**
+
+* Never expose a copy constructor / assignment of the set to Python without also keeping the source
+  alive. The safe model is: one `std::shared_ptr<Bez_traits>` owned by the module (or by each
+  wrapper object), constructed once, passed to **every** set via
+  `General_polygon_set_2(const Traits_2& traits)` — that ctor aliases (`m_traits(&tr)`,
+  `m_traits_owner(false)`), so all sets then share one cache whose lifetime *you* control.
+* If you must copy a set, keep the source alive at least as long as the copy, or (better) re-extract
+  `polygons_with_holes()` and rebuild a fresh set from them.
+* `Curve_2` inputs may be discarded immediately (rule from §22.2.2).
+
+#### 22.2.5 **[verified] Performance trap: never reuse the same Bézier `General_polygon_2` across operations**
+
+`_Bezier_point_2` is `Handle_for`-based (`Bezier_point_2.h:512-535`), so copies of a
+`General_polygon_2` **share the point representations**, and every Boolean operation *mutates* them
+(`_Bezier_point_2::equals → compare_xy → merge_originators`, seen repeatedly on the stack of a hung
+process). The originator lists grow monotonically and comparisons degrade catastrophically.
+
+Same `join` + `polygons_with_holes` + `is_valid` repeated on the rounded-square pair:
+
+| iteration | **reusing** the same two `General_polygon_2` objects | **rebuilding** them each time |
+| --- | --- | --- |
+| #0 | join+extract 0.0032 s, `is_valid` 0.00019 s | 0.0031 s / 0.00017 s |
+| #1 | 0.0034 s / 0.0033 s | 0.0024 s / 0.00017 s |
+| #2 | **0.077 s** / **0.214 s** | 0.0024 s / 0.00018 s |
+| #3 | **5.59 s** / **18.2 s** | 0.0025 s / 0.00019 s |
+| #4 | did not finish in 20 min | 0.0025 s / 0.00020 s |
+| #5–#7 | — | constant |
+
+The control run rebuilds the polygons with the **same** `Bez_traits` object (same cache), so the
+cache is *not* the culprit — the shared, mutated point/curve reps are. **[verified] Conic polygons do
+NOT show this** (8 reused iterations: 0.00064 s each, flat).
+
+⇒ In a binding, treat a Bézier `General_polygon_2` as **single-use**: rebuild it (or deep-copy it
+through `Curve_2` control points / a fresh `make_x_monotone` pass) before each Boolean operation, or
+chain operations through the `General_polygon_set_2` (whose arrangement owns its own curve copies)
+rather than through the input polygons.
+
+---
+
+### 22.3 B. Conic — `Gps_traits_2<Arr_conic_traits_2<Cartesian<BigRat>, Cartesian<Expr>, CORE_algebraic_number_traits>>`  **[verified]**
+
+#### 22.3.1 Instantiation and traits state
+
+```cpp
+typedef CGAL::CORE_algebraic_number_traits                          Nt_traits;
+typedef CGAL::Cartesian<Nt_traits::Rational>                        Rat_kernel;   // mpq_rational
+typedef CGAL::Cartesian<Nt_traits::Algebraic>                       Alg_kernel;   // CORE::Expr
+typedef CGAL::Arr_conic_traits_2<Rat_kernel, Alg_kernel, Nt_traits> Con_traits;
+typedef CGAL::Gps_traits_2<Con_traits>                              Gps_con_traits;
+typedef Gps_con_traits::Polygon_2                                   Con_polygon_2;
+typedef Gps_con_traits::Polygon_with_holes_2                        Con_pwh_2;
+typedef CGAL::General_polygon_set_2<Gps_con_traits>                 Con_set_2;
+```
+
+State of `Arr_conic_traits_2` (verbatim, `Arr_conic_traits_2.h:115-145`):
+
+```cpp
+  typedef std::shared_ptr<Rat_kernel>               Shared_rat_kernel;
+  typedef std::shared_ptr<Alg_kernel>               Shared_alg_kernel;
+  typedef std::shared_ptr<Nt_traits>                Shared_nt_traits;
+
+  const Shared_rat_kernel m_rat_kernel;             // *** const members ***
+  const Shared_alg_kernel m_alg_kernel;
+  const Shared_nt_traits  m_nt_traits;
+  mutable Intersection_map m_inter_map;             // conic-pair -> intersection points
+
+  Arr_conic_traits_2()
+   : m_rat_kernel(std::make_shared<Rat_kernel>()),
+     m_alg_kernel(std::make_shared<Alg_kernel>()),
+     m_nt_traits(std::make_shared<Nt_traits>()) {}
+  Arr_conic_traits_2(Shared_rat_kernel, Shared_alg_kernel, Shared_nt_traits);
+  Shared_rat_kernel rat_kernel() const;   Shared_alg_kernel alg_kernel() const;
+  Shared_nt_traits  nt_traits()  const;
+  static size_t get_index();              // atomic conic-id counter
+```
+
+⇒ the conic traits is **copy-constructible** (shared kernels are shared; `m_inter_map` is copied by
+value, so each copy gets its own intersection cache — **no dangling cache, unlike Bézier**) but its
+copy-**assignment** is implicitly deleted (const members). See §22.3.4.
+
+#### 22.3.2 Construction recipes
+
+**(a) full ellipse → general polygon** — `r x² + s y² + t xy + u x + v y + w = 0`, `4rs − t² > 0`:
+
+```cpp
+Con_polygon_2 ellipse(const Con_traits& tr, int r,int s,int t,int u,int v,int w) {
+  auto ctr_cv = tr.construct_curve_2_object();
+  Con_traits::Curve_2 c = ctr_cv(Rational(r),Rational(s),Rational(t),
+                                 Rational(u),Rational(v),Rational(w));   // full conic, CCW
+  std::vector<std::variant<Con_traits::Point_2, Con_traits::X_monotone_curve_2>> objs;
+  tr.make_x_monotone_2_object()(c, std::back_inserter(objs));            // -> exactly 2 arcs
+  Con_polygon_2 p;
+  for (auto& o : objs)
+    if (auto* x = std::get_if<Con_traits::X_monotone_curve_2>(&o)) p.push_back(*x);
+  CGAL::Gps_traits_adaptor<Con_traits> adp(tr);
+  if (adp.orientation_2_object()(p.curves_begin(), p.curves_end()) != CGAL::COUNTERCLOCKWISE)
+    p.reverse_orientation();
+  return p;
+}
+// e.g. the ellipse x²/16 + y²/9 = 1 is  ellipse(tr, 9,16,0, 0,0,-144)   [verified: size()==2]
+//      translated to centre (5,0):      ellipse(tr, 9,16,0, -90,0, 81)
+```
+
+**(b) rectangle of "special segments"** (straight edges inside a conic arrangement):
+
+```cpp
+Con_polygon_2 rect(const Con_traits& tr, int x0,int y0,int x1,int y1) {
+  auto ctr_x = tr.construct_x_monotone_curve_2_object();
+  using P = Con_traits::Point_2;                                  // Conic_point_2<Alg_kernel>
+  P a{Algebraic(x0),Algebraic(y0)}, b{Algebraic(x1),Algebraic(y0)},
+    c{Algebraic(x1),Algebraic(y1)}, d{Algebraic(x0),Algebraic(y1)};
+  Con_polygon_2 p;
+  p.push_back(ctr_x(a,b)); p.push_back(ctr_x(b,c));
+  p.push_back(ctr_x(c,d)); p.push_back(ctr_x(d,a));               // CCW by construction
+  CGAL::Gps_traits_adaptor<Con_traits> adp(tr);
+  if (adp.orientation_2_object()(p.curves_begin(), p.curves_end()) != CGAL::COUNTERCLOCKWISE)
+    p.reverse_orientation();
+  return p;
+}
+```
+
+⚠ `P a(Algebraic(x0), Algebraic(y0));` is a **vexing parse** (declares a function). Use braces.
+
+Relevant verbatim functor signatures:
+
+```cpp
+  class Construct_curve_2 {                       // ctor is private; friend class Arr_conic_traits_2
+  public:
+    Curve_2 operator()() const;                                                // empty
+    Curve_2 operator()(const Rational& r, const Rational& s, const Rational& t,
+                       const Rational& u, const Rational& v, const Rational& w) const;
+        // \pre The conic C must be an ellipse (so 4rs - t^2 > 0).
+    Curve_2 operator()(const Rational& r, …, const Rational& w, Orientation orient,
+                       const Point_2& source, const Point_2& target) const;
+        // \pre source and target must be on the conic boundary and must not be the same.
+    Curve_2 operator()(const Rat_point_2& p1, const Rat_point_2& p2,
+                       const Rat_point_2& p3) const;                 // circular arc, \pre not collinear
+    Curve_2 operator()(const Rat_point_2& p1, …, const Rat_point_2& p5) const;  // \pre no 3 collinear
+    Curve_2 operator()(const Rational& r, …, const Rational& w, Orientation orient,
+                       const Point_2& app_source,
+                       const Rational& r_1, …, const Rational& w_1,
+                       const Point_2& app_target,
+                       const Rational& r_2, …, const Rational& w_2) const;
+    Curve_2 operator()(const Point_2& source, const Point_2& target) const;    // segment
+    Curve_2 operator()(const Rat_segment_2& seg) const;
+    Curve_2 operator()(const Rat_circle_2& circ) const;
+    Curve_2 operator()(const Rat_circle_2& circ, Orientation orient,
+                       const Point_2& source, const Point_2& target) const;
+  };
+  Construct_curve_2 construct_curve_2_object() const;   // { return Construct_curve_2(*this); }
+
+  class Construct_x_monotone_curve_2 {                 // ctor is private; friend class Arr_conic_traits_2
+  public:
+    X_monotone_curve_2 operator()(const Curve_2& cv) const;        // \pre cv is x-monotone
+    X_monotone_curve_2 operator()(const Curve_2& cv, const Conic_id& id) const;
+    X_monotone_curve_2 operator()(const Curve_2& cv, const Point_2& source,
+                                  const Point_2& target, const Conic_id& id) const;
+    X_monotone_curve_2 operator()(const Point_2& source, const Point_2& target) const;
+        // "special segment", \pre source != target
+    X_monotone_curve_2 operator()(const Algebraic& a, const Algebraic& b, const Algebraic& c,
+                                  const Point_2& source, const Point_2& target) const;
+        // special segment on the line ax+by+c=0, \pre both endpoints lie on it
+  };
+  Construct_x_monotone_curve_2 construct_x_monotone_curve_2_object () const;
+
+  class Compare_endpoints_xy_2 { public:
+    Comparison_result operator()(const X_monotone_curve_2& cv) const
+    { return (cv.is_directed_right()) ? SMALLER : LARGER; } };
+  Compare_endpoints_xy_2 compare_endpoints_xy_2_object() const;
+
+  class Construct_opposite_2 { public:
+    X_monotone_curve_2 operator()(const X_monotone_curve_2& cv) const     // *** const, unlike Bezier
+    { return cv.flip(); } };
+  Construct_opposite_2 construct_opposite_2_object() const;
+```
+
+⚠ `Construct_curve_2` and `Construct_x_monotone_curve_2` hold `const Traits& m_traits` — **the traits
+object must outlive every functor you keep**. Take them by value at the call site, don't cache them.
+The `Curve_2` / `X_monotone_curve_2` values they return do **not** reference the traits
+**[verified]** (the local `Conic_arc_2` in `ellipse()` above is destroyed on return and everything
+still works).
+
+#### 22.3.3 Verified Boolean results
+
+`E1` = ellipse centre (0,0), a=4, b=3 (2 arcs); `E2` = the same translated to (5,0) (2 arcs);
+`R` = rectangle (0,−2)-(8,2) of 4 special segments.
+
+| operation | result **[verified]** |
+| --- | --- |
+| `E1 ∪ E2` | 1 p-w-h, outer **4** curves, 0 holes |
+| `E1 ∩ E2` | 1 p-w-h, outer **4** curves, 0 holes |
+| `E1 − E2` | 1 p-w-h, outer **4** curves, 0 holes |
+| `E1 ⊕ E2` | 1 p-w-h, outer **4** curves, **1 hole of 4 curves** |
+| `do_intersect(E1,E2)` (binary) | `1` |
+| `E1 ∪ R` | 1 p-w-h, outer **5** curves |
+| `E1 ∩ R` | 1 p-w-h, outer **5** curves |
+| `E1 − R` | 1 p-w-h, outer **5** curves |
+| `R − E1` | 1 p-w-h, outer **5** curves |
+| `E1 ⊕ R` | 1 p-w-h, outer **5** curves + 1 hole of **5** curves |
+| `complement(E1)` | `is_unbounded()==1`, outer 0, 1 hole of 2 curves |
+| aggregated `join({E1,E2,R})`, k=5 | 1 p-w-h, outer **10** curves |
+| `is_valid()` after every op | `1` |
+
+Free functions **[verified]**: `CGAL::join(E1,E2,res)` → `true`, res outer 4 curves;
+`CGAL::join(E1,E2,res,traits)` → `true`; `CGAL::intersection` → 1 p-w-h (4 curves);
+`CGAL::difference` → 1; `CGAL::symmetric_difference` → 1; `CGAL::do_intersect(E1,E2)` → `1`;
+`CGAL::oriented_side(E1,E2)` → `1` (`ON_POSITIVE_SIDE`); `CGAL::complement(E1,c)` → unbounded,
+1 hole; `CGAL::join(begin,end,oi)` (aggregated) → 1 p-w-h;
+`CGAL::do_intersect(begin,end)` → **`0` for an overlapping pair** — the §0 gotcha 2 inversion is
+confirmed again here **[verified]**.
+
+Timing: build 2 ellipses + all 12 operations + all free functions ≈ **0.1 s** total. Repeated
+`join`+`is_valid` on the *same* polygons: flat at 0.00064 s / 0.000076 s over 8 iterations
+**[verified]** — no Bézier-style degradation.
+
+#### 22.3.4 **[verified] `General_polygon_set_2<Gps_traits_2<Arr_conic_traits_2<…>>>::operator=` does not compile**
+
+```
+Gps_on_surface_base_2.h:182:22: error: object of type 'CGAL::Arr_traits_adaptor_2<Traits_2>' …
+  cannot be assigned because its copy assignment operator is implicitly deleted
+Arr_traits_adaptor_2.h:3299 : … base class 'Arr_traits_basic_adaptor_2<…>' has a deleted copy assignment
+Arr_traits_adaptor_2.h:44   : … base class 'CGAL::Gps_traits_2<…>' has a deleted copy assignment
+Gps_traits_2.h:29           : … base class 'CGAL::Arr_conic_traits_2<…>' has a deleted copy assignment
+Arr_conic_traits_2.h:120    : … field 'm_rat_kernel' has no copy assignment operator
+```
+
+The offending line is `Gps_on_surface_base_2.h:182`:
+
+```cpp
+    m_traits_adaptor = CGAL::Arr_traits_adaptor_2<Traits_2>(*m_traits);
+```
+
+Copy **construction** of the set is fine; only assignment is dead. Also fine:
+`Con_set_2 B(A);` **[verified]** (npwh preserved). In a type-erased core, do **not** put
+`operator=` in the virtual interface for the conic instantiation — expose `clone()` (copy ctor) and
+`swap`/move instead, or implement assign as *destroy + placement-copy-construct*.
+
+---
+
+### 22.4 C. Polycurve of circular arcs — `Gps_traits_2<Arr_polycurve_traits_2<Arr_circle_segment_traits_2<K>>>`  **[verified]**
+
+This combination appears nowhere else in these maps. It **works** and is the natural
+"rounded-rectangle" representation.
+
+#### 22.4.1 Instantiation
+
+```cpp
+typedef CGAL::Exact_predicates_exact_constructions_kernel  Kernel;
+typedef CGAL::Arr_circle_segment_traits_2<Kernel>          Sub_traits;   // Filer_ defaults to true
+typedef CGAL::Arr_polycurve_traits_2<Sub_traits>           Pc_traits;
+typedef CGAL::Gps_traits_2<Pc_traits>                      Gps_pc_traits;
+typedef Gps_pc_traits::Polygon_2                           Pc_polygon_2; // General_polygon_2<Pc_traits>
+typedef Gps_pc_traits::Polygon_with_holes_2                Pc_pwh_2;
+typedef CGAL::General_polygon_set_2<Gps_pc_traits>         Pc_set_2;
+```
+
+Relevant typedefs (verbatim from `Arr_polycurve_traits_2.h` / `Arr_polycurve_basic_traits_2.h`):
+
+```cpp
+  using Subcurve_traits_2      = SubcurveTraits_2;
+  using Point_2                = typename Subcurve_traits_2::Point_2;              // _One_root_point_2
+  using X_monotone_subcurve_2  = typename Subcurve_traits_2::X_monotone_curve_2;   // _X_monotone_circle_segment_2
+  using X_monotone_curve_2     = internal::X_monotone_polycurve_2<X_monotone_subcurve_2, Point_2>;
+  using Subcurve_2             = typename Subcurve_traits_2::Curve_2;              // _Circle_segment_2
+  using Curve_2                = internal::Polycurve_2<Subcurve_2, Point_2>;
+  using Compare_endpoints_xy_2 = typename Base::Compare_endpoints_xy_2;            // present ✔
+  using Construct_opposite_2   = typename Base::Construct_opposite_2;              // present ✔, operator() const
+  const Subcurve_traits_2* subcurve_traits_2() const;
+```
+
+`X_monotone_curve_2` (`Arr_geometry_traits/Polycurve_2.h`) exposes:
+
+```cpp
+  size_type              number_of_subcurves() const;
+  CGAL_DEPRECATED size_type size() const;                 // == number_of_subcurves()
+  Subcurve_const_iterator subcurves_begin() const;   Subcurve_const_iterator subcurves_end() const;
+  Subcurve_const_reverse_iterator subcurves_rbegin()/rend() const;
+  const Subcurve_type_2& operator[](std::size_t i) const;
+  void push_back(const Subcurve_type_2&);   void push_front(const Subcurve_type_2&);
+  Point_const_iterator points_begin()/points_end() const;   size_type number_of_points() const;
+  Bbox_2 bbox() const;
+```
+
+#### 22.4.2 Construction recipe: rounded rectangle
+
+The boundary must be cut into **x-monotone polycurves**; inside one polycurve every subcurve must
+run in the *same* lexicographic direction and be stored in that order.
+
+```cpp
+static void xsplit(const Sub_traits& st, const Sub_traits::Curve_2& c,
+                   std::vector<Sub_traits::X_monotone_curve_2>& out) {
+  std::vector<std::variant<Sub_traits::Point_2, Sub_traits::X_monotone_curve_2>> objs;
+  st.make_x_monotone_2_object()(c, std::back_inserter(objs));
+  for (auto& o : objs)
+    if (auto* x = std::get_if<Sub_traits::X_monotone_curve_2>(&o)) out.push_back(*x);
+}
+
+Pc_polygon_2 rounded_rect(const Pc_traits& pt, const Sub_traits& st,
+                          int x0,int y0,int x1,int y1,int r) {
+  auto ctr_x = pt.construct_x_monotone_curve_2_object();
+  auto P  = [](int a,int b){ return Kernel::Point_2(NT(a),NT(b)); };            // rational corner point
+  auto SP = [](int a,int b){ return Sub_traits::Point_2(NT(a),NT(b)); };        // traits point
+  using SC = Sub_traits::Curve_2;                                              // _Circle_segment_2
+  Pc_polygon_2 pgn;  std::vector<Sub_traits::X_monotone_curve_2> ch;
+
+  // 1) bottom chain, LEFT -> RIGHT : BL arc, bottom segment, BR arc
+  ch.clear();
+  xsplit(st, SC(P(x0+r,y0+r), NT(r), CGAL::COUNTERCLOCKWISE, SP(x0,y0+r), SP(x0+r,y0)), ch);
+  xsplit(st, SC(P(x0+r,y0), P(x1-r,y0)), ch);
+  xsplit(st, SC(P(x1-r,y0+r), NT(r), CGAL::COUNTERCLOCKWISE, SP(x1-r,y0), SP(x1,y0+r)), ch);
+  pgn.push_back(ctr_x(ch.begin(), ch.end()));
+
+  // 2) right edge, BOTTOM -> TOP  (a single vertical special case, own polycurve)
+  ch.clear(); xsplit(st, SC(P(x1,y0+r), P(x1,y1-r)), ch);
+  pgn.push_back(ctr_x(ch.begin(), ch.end()));
+
+  // 3) top chain, RIGHT -> LEFT : TR arc, top segment, TL arc — stored RIGHT-to-LEFT
+  ch.clear();
+  xsplit(st, SC(P(x1-r,y1-r), NT(r), CGAL::COUNTERCLOCKWISE, SP(x1,y1-r), SP(x1-r,y1)), ch);
+  xsplit(st, SC(P(x1-r,y1), P(x0+r,y1)), ch);
+  xsplit(st, SC(P(x0+r,y1-r), NT(r), CGAL::COUNTERCLOCKWISE, SP(x0+r,y1), SP(x0,y1-r)), ch);
+  pgn.push_back(ctr_x(ch.begin(), ch.end()));           // *** do NOT std::reverse this ***
+
+  // 4) left edge, TOP -> BOTTOM
+  ch.clear(); xsplit(st, SC(P(x0,y1-r), P(x0,y0+r)), ch);
+  pgn.push_back(ctr_x(ch.begin(), ch.end()));
+  return pgn;                                            // size()==4, orientation()==CCW [verified]
+}
+```
+
+`Construct_x_monotone_curve_2` (verbatim preconditions, `Arr_polycurve_basic_traits_2.h:1195-1345`):
+
+```cpp
+    X_monotone_curve_2 operator()(const X_monotone_subcurve_2& seg) const;
+        // \pre seg is not degenerated.
+    template <typename ForwardIterator>
+    X_monotone_curve_2 operator()(ForwardIterator begin, ForwardIterator end) const;
+        // \pre the range contains at least one subcurve
+        // \pre subcurves correspond to a well-oriented polycurve. That is, the target of the
+        //      i-th subcurve is a source of the (i+1)th subcurve.
+        // \pre the sequence of subcurves in the range forms a weak x-monotone polycurve.
+        // \pre the container should support bidirectional iteration.
+        // (a range of Point_2 is explicitly rejected: CGAL_error_msg("Cannot construct a polycurve
+        //  from a range of points!"))
+```
+
+**[verified] the "well-oriented" precondition is direction-sensitive.** Reversing a right-to-left
+chain (so it reads left-to-right in the container) aborts with
+
+```
+CGAL error: precondition violation!
+Expression : equal(get_min_v(*curr),get_max_v(*next))
+File       : /opt/homebrew/include/CGAL/Arr_polycurve_basic_traits_2.h
+Line       : 1329
+Explanation: Subcurves should concatenate in source->target manner
+```
+
+The functor checks `init_dir = cmp_seg_endpts(*curr)` on the first subcurve and requires **every**
+subcurve to have the same `Compare_endpoints_xy_2` result, then chains
+`max_v(curr) == min_v(next)` when `init_dir == SMALLER` and `min_v(curr) == max_v(next)` when it is
+`LARGER`. Since `Arr_circle_segment_traits_2::Make_x_monotone_2` preserves the input direction and
+emits subcurves in traversal order, the correct move is simply **not to re-order** what
+`make_x_monotone_2` gave you.
+
+#### 22.4.3 Verified Boolean results
+
+Two rounded rectangles, `A = [0,10]×[0,6]` r=2, `B = [6,16]×[3,9]` r=2, both 4 polycurves
+(8 circle-segment subcurves each):
+
+| operation | result **[verified]** |
+| --- | --- |
+| `join` | 1 p-w-h, outer **8 polycurves / 14 subcurves**, 0 holes |
+| `intersection` | 1 p-w-h, outer **4 polycurves / 6 subcurves** |
+| `difference` | 1 p-w-h, outer **6 polycurves / 10 subcurves** |
+| `symmetric_difference` | 1 p-w-h, outer 8 polycurves / 14 subcurves + **1 hole** |
+| `complement` | unbounded p-w-h, 1 hole |
+| copy of the set | 1 p-w-h, outer 4 polycurves / 8 subcurves |
+| `is_valid()` after every op | `1` |
+| whole program runtime | **< 0.05 s** |
+
+Free functions **[verified]**: `CGAL::join(a,b,res)` → `true`, res outer 8; `CGAL::intersection` → 1
+(outer 4); `CGAL::difference` → 1; `CGAL::do_intersect(a,b)` → `1`; `CGAL::complement(a,c)` →
+unbounded + 1 hole; aggregated `CGAL::join(begin,end,oi)` → 1.
+
+#### 22.4.4 **[verified] The polycurve traits is stateful and its copy-ASSIGNMENT is broken**
+
+```cpp
+// Arr_polycurve_basic_traits_2.h:78-119 (verbatim)
+  const Subcurve_traits_2* m_subcurve_traits;
+  bool m_own_traits;
+
+  Arr_polycurve_basic_traits_2() :
+    m_subcurve_traits(new Subcurve_traits_2()), m_own_traits(true) {}
+
+  Arr_polycurve_basic_traits_2(const Subcurve_traits_2* geom_traits) :
+    m_subcurve_traits(geom_traits), m_own_traits(false) {}
+
+  Arr_polycurve_basic_traits_2(const Arr_polycurve_basic_traits_2& other)
+  { m_subcurve_traits = (other.m_own_traits) ?
+      new Subcurve_traits_2() : other.m_subcurve_traits;      // FRESH one if other owns
+    m_own_traits = other.m_own_traits; }
+
+  ~Arr_polycurve_basic_traits_2()
+  { if (m_own_traits) delete m_subcurve_traits; }
+```
+
+There is **no user-declared copy-assignment operator**, so the compiler generates a member-wise one
+(deprecated but legal). That assignment copies the raw pointer *and* the `m_own_traits == true`
+flag ⇒ **two owners of one pointer, and a leak of the target's old pointer**.
+
+Minimal reproduction **[verified]**:
+
+```cpp
+CGAL::Arr_polycurve_traits_2<CGAL::Arr_circle_segment_traits_2<Epeck>> a, b;
+// a.sub=0x102a16170  b.sub=0x102a16190
+b = a;
+// b.sub=0x102a16170   <-- aliases a's, both m_own_traits==true
+// *** SIGSEGV at scope exit (double delete) ***
+```
+
+and the exact shape `Gps_on_surface_base_2::operator=` uses **[verified]**:
+
+```cpp
+CGAL::Arr_traits_adaptor_2<Gps_pc_traits> ad;  Gps_pc_traits t;
+ad = CGAL::Arr_traits_adaptor_2<Gps_pc_traits>(t);
+// the TEMPORARY owns a fresh subcurve traits, ad now points at it, the temporary deletes it
+// *** ad.subcurve_traits_2() dangles; SIGSEGV when ad is destroyed ***
+```
+
+Consequently:
+
+* `Pc_set_2 C; C = A;` **compiles, runs, produces correct results, and then SIGSEGVs at scope exit**
+  **[verified]** (`EXIT=139`; the `[C] survived scope exit` marker is never printed).
+* The same assignment on `Gps_circle_segment_traits_2` (no owned pointer) is fine **[verified]**.
+* `Pc_set_2 B(A);` (copy **construction**) is fine, but the copy's arrangement still aliases A's
+  traits — `A.arr.traits == B.arr.traits` **[verified]**.
+* `Gps_traits_adaptor<Pc_traits> adp(pt)` allocates a **fresh** `Arr_circle_segment_traits_2`
+  (different pointer from `pt.subcurve_traits_2()` **[verified]**). Harmless here (that traits is
+  effectively stateless apart from a cache flag), but it means `General_polygon_2::orientation()`
+  allocates one per call.
+
+**Binding rule:** never expose assignment for a polycurve-based set. Use copy construction (+ keep
+the source alive), or rebuild from `polygons_with_holes()`.
+
+---
+
+### 22.5 Free functions and `Tag_*` dispatch for general polygons  **[verified]**
+
+`Gps_default_traits.h` (verbatim, complete):
+
+```cpp
+template <class Polygon> struct Gps_default_traits {};
+
+template <class Kernel, class Container>
+struct Gps_default_traits<CGAL::Polygon_2<Kernel, Container> > {
+  typedef Arr_segment_traits_2<Kernel>                          Arr_traits;
+  typedef Gps_segment_traits_2<Kernel, Container, Arr_traits>   Traits;
+};
+template <class Kernel, class Container>
+struct Gps_default_traits<CGAL::Polygon_with_holes_2<Kernel, Container> > { … };
+
+template <class Arr_traits>
+struct Gps_default_traits<CGAL::General_polygon_2<Arr_traits> >
+{ typedef Gps_traits_2<Arr_traits>    Traits; };
+
+template <class Polygon>
+struct Gps_default_traits<CGAL::General_polygon_with_holes_2<Polygon> >
+{ typedef typename Gps_default_traits<Polygon>::Traits Traits; };
+```
+
+**Answer to "which `Tag_*` dispatch applies": none.** The `Tag_true` / `Tag_false` overloads exist
+**only** for `CGAL::Polygon_2<Kernel,Container>` / `CGAL::Polygon_with_holes_2<…>` inputs (they
+choose between the polyline-conversion path and plain segment traits). For
+`General_polygon_2<ArrTraits>` the free functions pick
+`Gps_default_traits<Polygon>::Traits = Gps_traits_2<ArrTraits>` directly and there is **no tag
+parameter at all**. Passing `CGAL::Tag_true()`/`Tag_false()` to a general-polygon overload does not
+compile.
+
+The general-polygon overload set (verbatim shapes; `ArrTraits` deduced from the first argument):
+
+```cpp
+// join: the result is a REFERENCE parameter, not an output iterator (a join of two polygons is
+//       always at most one polygon-with-holes); the return value says whether they overlapped.
+template <typename ArrTraits, typename Traits>
+inline bool join(const General_polygon_2<ArrTraits>& pgn1,
+                 const General_polygon_2<ArrTraits>& pgn2,
+                 General_polygon_with_holes_2<General_polygon_2<ArrTraits> >& res,
+                 Traits& traits);                        // NOTE: non-const Traits&
+template <typename ArrTraits>
+inline bool join(const General_polygon_2<ArrTraits>& pgn1,
+                 const General_polygon_2<ArrTraits>& pgn2,
+                 General_polygon_with_holes_2<General_polygon_2<ArrTraits> >& res);
+// … plus (Polygon, PolygonWithHoles), (PolygonWithHoles, Polygon),
+//     (PolygonWithHoles, PolygonWithHoles) — the last one templated on Polygon_ only.
+
+// intersection / difference / symmetric_difference: OutputIterator
+template <typename ArrTraits, typename OutputIterator, typename Traits>
+inline OutputIterator intersection(const General_polygon_2<ArrTraits>& pgn1,
+                                   const General_polygon_2<ArrTraits>& pgn2,
+                                   OutputIterator oi, Traits& traits);
+template <typename ArrTraits, typename OutputIterator>
+inline OutputIterator intersection(const General_polygon_2<ArrTraits>& pgn1,
+                                   const General_polygon_2<ArrTraits>& pgn2, OutputIterator oi);
+// (same four argument-type combinations; difference and symmetric_difference are identical in shape)
+
+// complement: General_polygon_2 -> General_polygon_with_holes_2& (void), PWH -> OutputIterator
+template <typename ArrTraits, typename Traits>
+void complement(const General_polygon_2<ArrTraits>& pgn,
+                General_polygon_with_holes_2<General_polygon_2<ArrTraits> >& res, Traits& traits);
+template <typename ArrTraits>
+void complement(const General_polygon_2<ArrTraits>& pgn,
+                General_polygon_with_holes_2<General_polygon_2<ArrTraits> >& res);
+template <typename Polygon_, typename OutputIterator>
+OutputIterator complement(General_polygon_with_holes_2<Polygon_>& pgn, OutputIterator oi);  // non-const!
+
+// do_intersect / oriented_side: same four combinations, bool / Oriented_side
+template <typename ArrTraits, typename GpsTraits>
+inline bool do_intersect(const General_polygon_2<ArrTraits>& pgn1,
+                         const General_polygon_2<ArrTraits>& pgn2, GpsTraits& traits);
+template <typename ArrTraits>
+inline bool do_intersect(const General_polygon_2<ArrTraits>& pgn1,
+                         const General_polygon_2<ArrTraits>& pgn2);
+template <typename ArrTraits, typename GpsTraits>
+inline Oriented_side oriented_side(const typename ArrTraits::Point_2& p,
+                                   const General_polygon_2<ArrTraits>& pgn, GpsTraits& traits);
+
+// aggregated (range) forms reach the general-polygon path through
+//   Disable_if_Polygon_2_iterator<InputIterator>*
+template <typename InputIterator, typename OutputIterator>
+inline OutputIterator join(InputIterator begin, InputIterator end, OutputIterator oi,
+                           unsigned int k=5, Disable_if_Polygon_2_iterator<InputIterator>* = 0);
+```
+
+**[verified]** all of the above run for Bézier, conic and polycurve general polygons. Two practical
+notes:
+
+* Every "without Traits" overload **default-constructs `Gps_traits_2<ArrTraits>` inside the call**.
+  For Bézier that means a **brand-new `Bezier_cache` + `Intersection_map` per free-function call** —
+  measurable waste and no cross-call caching. Use the `Traits&` overloads with your own long-lived
+  traits object (note it takes a **non-const** lvalue reference, so keep a non-const member).
+* The aggregated range `do_intersect(begin,end)` is still **inverted** (§0 gotcha 2);
+  re-confirmed here with conic polygons **[verified]** (`0` for an overlapping pair).
+
+---
+
+### 22.6 Validation and preconditions for curved general polygons  **[verified]**
+
+`General_polygon_set_2` → `General_polygon_set_on_surface_2` → `Gps_on_surface_base_2<…,
+PreconditionValidationPolicy>`:
+
+```cpp
+  struct PreconditionValidationPolicy {
+    template <class Polygon, class Traits>
+    inline static void is_valid(const Polygon& p, const Traits& t)
+    { CGAL_precondition(is_valid_unknown_polygon(p, t)); CGAL_USE(p); CGAL_USE(t); }
+  };
+```
+
+Behaviour with a clockwise curved polygon (polycurve rounded rectangle after
+`reverse_orientation()`) **[verified]**:
+
+```
+CGAL warning: check violation!
+Expression : valid_orientation
+File       : …/Gps_polygon_validation.h
+Line       : 307
+Explanation: The polygon has a wrong orientation.
+   (is_valid_polygon returns 0)
+
+CGAL error: precondition violation!
+Expression : is_valid_unknown_polygon(p, t)
+File       : …/General_polygon_set_on_surface_2.h
+Line       : 39
+   -> CGAL::Precondition_exception thrown by BOTH
+      General_polygon_set_2(const Polygon_2&)  and  insert(const Polygon_2&)
+```
+
+`e.expression() == "is_valid_unknown_polygon(p, t)"`,
+`e.filename() == "/opt/homebrew/include/CGAL/General_polygon_set_on_surface_2.h"`,
+`e.line_number() == 39`. As per §0 gotcha 5, **all of this vanishes under `NDEBUG`** — validate in
+your own code.
+
+The three checks `is_valid_polygon` performs, in order (`Gps_polygon_validation.h:291-313`):
+
+1. `is_closed_polygon` — consecutive `Construct_vertex_2(cv,1) == Construct_vertex_2(next,0)`,
+   wrap-around, **rejects a 1-curve polygon** and any curve with `vertex(cv,0) == vertex(cv,1)`.
+   Uses `Gps_traits_adaptor<Traits_2> traits_adapter(traits);` — i.e. a **copy** of your traits.
+2. `is_simple_polygon` — a sweep (`Gps_polygon_validation_visitor`); reports
+   `ERROR_EDGE_INTERSECTION` / `ERROR_EDGE_OVERLAP` / `ERROR_VERTEX_INTERSECTION` via
+   `CGAL_warning_msg`.
+3. `has_valid_orientation_polygon` — `Gps_traits_adaptor<Traits_2>::Orientation_2` must return
+   `COUNTERCLOCKWISE`.
+
+For polygons **with holes**, `is_valid_polygon_with_holes` additionally runs
+`is_relatively_simple_polygon_with_holes`, `is_crossover_outer_boundary`,
+`has_valid_orientation_polygon_with_holes` (outer CCW, **every hole CW**) and
+`are_holes_and_boundary_pairwise_disjoint`.
+
+Note that `Gps_traits_adaptor<Traits_2>::Orientation_2` only inspects curves whose
+`Compare_endpoints_xy_2` is `SMALLER` following one that is `LARGER` (the local leftmost "cusp"),
+so it needs at least one such transition — a boundary of exactly two curves (a full ellipse, a
+Bézier lens) satisfies this **[verified]**.
+
+---
+
+### 22.7 Cheat-sheet for the type-erased core / Cython layer
+
+| | Bézier | conic | polycurve⟨circle-segment⟩ |
+| --- | --- | --- | --- |
+| `General_polygon_set_2<Gps_traits_2<…>>` instantiates | ✔ | ✔ | ✔ |
+| join / intersection / difference / symdiff / complement / binary `do_intersect` | ✔ | ✔ | ✔ |
+| aggregated (range) `join` | ✔ | ✔ | ✔ |
+| free functions (`CGAL::join`, …) | ✔ | ✔ | ✔ |
+| set **copy ctor** | compiles & runs, **but see below** | ✔ | ✔ (source's traits aliased) |
+| set **`operator=`** | compiles & runs (traits aliased) | ✘ **compile error** | ✘ **SIGSEGV** |
+| copy's arrangement aliases source's traits | ✔ (hazard) | ✔ (hazard) | ✔ (hazard) |
+| destroy source, use copy | **SIGSEGV [verified]** | UB (survives in practice) | UB |
+| reusing a `General_polygon_2` across ops | **catastrophic slowdown [verified]** | fine | fine |
+| typical runtime, 2 shapes, all 6 ops | 3.4 s (lens) / ms-scale per op | ~0.1 s | < 0.05 s |
+| `Construct_opposite_2::operator()` const? | **no** (harmless) | yes | yes |
+| traits copy semantics | shallow, non-owning cache | shared_ptr kernels + own inter-map | **fresh** subcurve traits if source owns |
+
+Recommended shape for the core:
+
+```cpp
+template <class ArrTraits>
+struct CurvedGps {
+  using GT   = CGAL::Gps_traits_2<ArrTraits>;
+  using Pgn  = typename GT::Polygon_2;
+  using Pwh  = typename GT::Polygon_with_holes_2;
+  using Set  = CGAL::General_polygon_set_2<GT>;
+
+  std::shared_ptr<GT> traits_ = std::make_shared<GT>();   // ONE traits for the whole session
+  std::unique_ptr<Set> set_   = std::make_unique<Set>(*traits_);   // aliasing ctor: m_traits_owner=false
+
+  // never copy `set_`; implement "copy" as: extract PWHs, build a new Set from them.
+  std::vector<Pwh> extract() const { std::vector<Pwh> v; set_->polygons_with_holes(std::back_inserter(v)); return v; }
+};
+```
+
+* Using the `Set(const Traits_2&)` constructor sidesteps *both* the per-set cache allocation and the
+  copy-aliasing hazard: `m_traits` then points at *your* long-lived traits, and any arrangement
+  copy aliases the same object.
+* Expose `clone()` implemented as "extract → rebuild", **not** as the C++ copy constructor.
+* For Bézier, additionally rebuild the input `General_polygon_2` (or feed the set only once) before
+  each operation; never keep a `Pgn` around as a reusable "shape handle".
+* All three traits' `Construct_curve_2` / `Construct_x_monotone_curve_2` functors (conic, polycurve)
+  hold a `const Traits&`; obtain them fresh at each call site.

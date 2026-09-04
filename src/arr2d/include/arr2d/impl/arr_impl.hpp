@@ -120,7 +120,7 @@ struct KindPolicy<SegmentTypes> {
   static constexpr bool supports_walk = true;
   static constexpr bool supports_landmarks = true;
   static constexpr bool supports_trapezoid = true;
-  static constexpr bool supports_triangulation = true;   ///< the only kind: bounded + real segments
+  static constexpr bool supports_triangulation = false;  ///< compiles for segments, but CGAL 6.1 returns the WRONG face for faces with holes (CGAL_TRAPS_CHECKLIST) -> not exposed
   static constexpr bool supports_ray_shooting_simple = true;
   static constexpr bool supports_ray_shooting_walk = true;
   static constexpr bool supports_ray_shooting_trapezoid = true;
@@ -137,11 +137,11 @@ struct KindPolicy<LinearTypes> {
   static constexpr bool supports_simple = true;
   static constexpr bool supports_walk = true;
   static constexpr bool supports_landmarks = true;
-  static constexpr bool supports_trapezoid = true;
+  static constexpr bool supports_trapezoid = false;  ///< CGAL 6.1 bug: an attached Arr_trapezoid_ric_point_location crashes in before_remove_edge when the edge touches a vertex at infinity (Td_inactive_vertex ctor); see STAGE2_NOTES (kind_linear)
   static constexpr bool supports_triangulation = false;
   static constexpr bool supports_ray_shooting_simple = true;
   static constexpr bool supports_ray_shooting_walk = true;
-  static constexpr bool supports_ray_shooting_trapezoid = true;
+  static constexpr bool supports_ray_shooting_trapezoid = false;
   static constexpr bool supports_ray_shooting = true;
   static constexpr bool supports_global_is_valid = true;
 };
