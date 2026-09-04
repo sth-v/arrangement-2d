@@ -49,6 +49,9 @@ print(a2.regions.face_area(face))                # 8 -- an exact Fraction
   vertical decomposition.
 * **2D Boolean set operations** (`PolygonSet`, `|`, `&`, `-`, `^`, `~`) for the four
   kinds CGAL supports them for.
+* **Input cleanup** (`arrangement_2d.cleanup`) — tolerance-based snapping of messy segment
+  soups (endpoint gaps, near T-junctions, duplicates, dangling pieces) before the exact
+  arrangement, with a near-miss report to choose the tolerance.
 * **Region helpers** (`arrangement_2d.regions`) — merge faces, split a face with a curve,
   connected components, face areas, region extraction by predicate, union outlines.
 * **Plot helpers** (`arrangement_2d.plot`) — matplotlib rendering of arrangements,

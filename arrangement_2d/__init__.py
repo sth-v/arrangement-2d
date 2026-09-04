@@ -108,9 +108,9 @@ from .errors import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - for type checkers only
-    from . import plot, regions
+    from . import cleanup, plot, regions
 
-_LAZY_SUBMODULES = ("regions", "plot")
+_LAZY_SUBMODULES = ("regions", "plot", "cleanup")
 
 
 def __getattr__(name: str) -> Any:

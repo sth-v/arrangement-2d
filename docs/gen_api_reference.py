@@ -473,6 +473,7 @@ def build() -> str:
         for name in names:
             render_object(name, getattr(a2, name), doc)
     submodules = [(a2.regions, "Module `arrangement_2d.regions`"),
+                  (a2.cleanup, "Module `arrangement_2d.cleanup`"),
                   (a2.plot, "Module `arrangement_2d.plot`")]
     for module, title in submodules:
         render_submodule(module, title, doc)

@@ -123,6 +123,14 @@ region helpers) and ``arrangement_2d.plot`` (matplotlib helpers).
     - [`split_face`](#split_face)
     - [`supports_boolean_ops`](#supports_boolean_ops)
     - [`union_outline`](#union_outline)
+- [Module `arrangement_2d.cleanup`](#module-arrangement_2dcleanup)
+    - [`near_miss_report`](#near_miss_report)
+    - [`NearMissReport`](#nearmissreport)
+    - [`snap_segments`](#snap_segments)
+    - [`SnapResult`](#snapresult)
+    - [`clean_arrangement`](#clean_arrangement)
+    - [`remove_dangling_edges`](#remove_dangling_edges)
+    - [`segments_from_polylines`](#segments_from_polylines)
 - [Module `arrangement_2d.plot`](#module-arrangement_2dplot)
     - [`has_matplotlib`](#has_matplotlib)
     - [`lonlat`](#lonlat)
@@ -6456,6 +6464,146 @@ survives only if no face of the group fills it.
 >>> len(outline.polygons_with_holes()[0].outer)      # the chord is gone
 4
 ```
+
+## Module `arrangement_2d.cleanup`
+
+Tolerance-based cleanup of messy segment input before building an exact arrangement.
+
+CGAL's arrangement is *exact*: it computes every intersection, splits every curve at every
+intersection point, merges exactly overlapping pieces into single edges and records which
+input curves induced each edge. What it deliberately does not do is guess: two endpoints
+that differ by 1e-9 are two different points, and an endpoint that misses another segment
+by 1e-9 is a gap, not a T-junction. Real-world data (CAD exports, GIS, floating-point
+computations) is full of such near misses, and every one of them opens a face.
+
+This module closes those gaps *before* the exact arrangement is built:
+
+* `near_miss_report` measures how many endpoints almost touch other endpoints or the
+  interior of other segments, at several tolerances, so you can pick a tolerance that is
+  larger than the noise and smaller than the real geometry.
+* `snap_segments` clusters endpoints within a tolerance, snaps endpoints onto nearby
+  segments (splitting them there), removes degenerate and duplicate segments, and iterates
+  until nothing moves.
+* `clean_arrangement` runs `snap_segments`, builds the exact arrangement and
+  optionally removes dangling edges (edges with the same face on both sides), leaving only
+  the edges that bound faces.
+* `remove_dangling_edges` does the last step on any arrangement.
+
+Everything here is plain Python + NumPy over the public API; coordinates are handled as
+``float`` (the snapped positions become exact rationals when inserted).
+
+Example:
+
+```python
+import json, arrangement_2d as a2
+from arrangement_2d import cleanup
+
+segs = [((p[0], p[1]), (q[0], q[1])) for p, q in json.load(open("segments.json"))]
+print(cleanup.near_miss_report(segs))          # choose a tolerance from the histogram
+arr = cleanup.clean_arrangement(segs, tolerance=1e-3)
+faces = a2.regions.bounded_faces(arr)
+```
+
+### `near_miss_report`
+
+```python
+near_miss_report(segments: Iterable[Any], tolerances: Sequence[float] = (1e-09, 1e-06, 0.001, 0.01, 0.1, 1.0)) -> NearMissReport
+```
+
+Measure how far the input is from being exactly connected.
+
+For every endpoint the distance to the nearest *other* endpoint and to the nearest
+*foreign* segment interior is computed (O(n^2) in NumPy chunks; fine up to ~50k segments).
+
+### `NearMissReport`
+
+```python
+NearMissReport(n_segments: int, n_zero_length: int, n_exact_duplicates: int, n_endpoints: int, n_exact_endpoint_coincidences: int, endpoint_gaps: dict[float, int] = <factory>, t_junction_gaps: dict[float, int] = <factory>, n_exact_t_junctions: int = 0) -> None
+```
+
+Result of `near_miss_report`.
+
+#### Attributes of `NearMissReport`
+
+##### `NearMissReport.n_exact_t_junctions`
+
+int(x, base=10) -> integer
+
+Convert a number or string to an integer, or return 0 if no arguments
+are given.  If x is a number, return x.__int__().  For floating-point
+numbers, this truncates towards zero.
+
+If x is not a number or if base is given, then x must be a string,
+bytes, or bytearray instance representing an integer literal in the
+given base.  The literal can be preceded by '+' or '-' and be surrounded
+by whitespace.  The base defaults to 10.  Valid bases are 0 and 2-36.
+Base 0 means to interpret the base from the string as an integer literal.
+
+```python
+>>> int('0b100', base=0)
+4
+```
+
+Special methods: `__eq__`, `__hash__`
+
+### `snap_segments`
+
+```python
+snap_segments(segments: Iterable[Any], tolerance: float, *, snap_endpoints: bool = True, snap_to_edges: bool = True, max_iterations: int = 8) -> SnapResult
+```
+
+Close near misses smaller than ``tolerance`` in a set of segments.
+
+Each iteration (1) merges endpoint clusters closer than ``tolerance`` (every endpoint of a
+cluster moves to the cluster's first point), (2) splits every segment at the foreign
+endpoints within ``tolerance`` of its interior, moving the split to the endpoint (this
+turns near T-junctions into exact ones), and (3) drops zero-length and exactly duplicated
+segments. Iterations stop when nothing changes (snapping can create new near misses).
+
+Overlapping, collinear segments are *not* merged here: after snapping their endpoints
+onto each other they overlap exactly, and the exact arrangement merges exact overlaps
+into single edges by itself.
+
+### `SnapResult`
+
+```python
+SnapResult(segments: list[SegmentT], iterations: int, endpoints_merged: int, t_junctions_snapped: int, removed_degenerate: int, removed_duplicates: int) -> None
+```
+
+Result of `snap_segments`.
+
+Special methods: `__eq__`, `__hash__`
+
+### `clean_arrangement`
+
+```python
+clean_arrangement(segments: Iterable[Any], tolerance: float, *, kind: Any = 'segment', remove_dangling: bool = True, snap_endpoints: bool = True, snap_to_edges: bool = True, max_iterations: int = 8) -> Arrangement
+```
+
+`snap_segments` + exact arrangement (+ `remove_dangling_edges`).
+
+``kind`` may be ``"segment"`` (default) or any kind that accepts segments.
+
+### `remove_dangling_edges`
+
+```python
+remove_dangling_edges(arr: Arrangement, *, remove_vertices: bool = True) -> int
+```
+
+Remove every edge that has the same face on both sides (antennas, isolated pieces),
+repeating until none is left. Returns the number of removed edges.
+
+After this, every remaining edge separates two different faces, so the arrangement is
+exactly the set of region boundaries. Vertices left with degree 0 are removed too when
+``remove_vertices`` is true.
+
+### `segments_from_polylines`
+
+```python
+segments_from_polylines(polylines: Iterable[Sequence[Any]]) -> list[SegmentT]
+```
+
+Explode polylines (sequences of points) into segments, dropping zero-length pieces.
 
 ## Module `arrangement_2d.plot`
 

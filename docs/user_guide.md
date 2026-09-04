@@ -751,6 +751,54 @@ kind with Boolean set operations.
 
 ---
 
+## 14b. Cleaning up messy input (`arrangement_2d.cleanup`)
+
+The arrangement is exact, and that cuts both ways. CGAL computes every intersection,
+splits every curve at every intersection point, merges exactly overlapping pieces into one
+edge (recording all the input curves that induced it) and handles T-junctions and shared
+endpoints perfectly — *when they are exact*. Two endpoints that differ by 1e-9 are two
+different points; an endpoint that misses another segment by 1e-9 is a gap, not a
+T-junction. Data coming from CAD exports, GIS layers or floating-point computations is full
+of such near misses, and every one of them opens a face: the intended region leaks into
+its neighbour or into the unbounded face, and "the big faces are never found".
+
+`arrangement_2d.cleanup` closes those gaps *before* the exact arrangement is built:
+
+```python
+from arrangement_2d import cleanup, regions
+
+segs = [((x1, y1), (x2, y2)), ...]            # or cleanup.segments_from_polylines(polylines)
+
+print(cleanup.near_miss_report(segs))          # how many endpoint / T-junction gaps at each tolerance
+arr = cleanup.clean_arrangement(segs, tolerance=1e-2)     # snap, build exactly, drop dangling edges
+for face in regions.bounded_faces(arr):
+    print(regions.face_area(face))
+```
+
+* `near_miss_report(segs)` tells you, for several tolerances, how many endpoints almost
+  touch another endpoint and how many almost touch the interior of another segment. Pick a
+  tolerance above the noise and below the real geometry.
+* `snap_segments(segs, tolerance)` merges endpoint clusters closer than the tolerance,
+  snaps endpoints onto nearby segments (splitting them there, so near T-junctions become
+  exact ones), drops zero-length and duplicate segments, and iterates until nothing moves.
+  Collinear near-overlaps become exact overlaps, which the arrangement then merges into a
+  single edge by itself.
+* `remove_dangling_edges(arr)` removes every edge that has the same face on both sides
+  (antennas, isolated pieces), repeatedly, so that every remaining edge separates two
+  faces.
+* `clean_arrangement(segs, tolerance)` is the three steps in one call.
+
+On a real 4965-segment CAD drawing (`tst.json` in the repository) the exact arrangement
+finds 4 of the 10 building outlines; after `clean_arrangement(..., tolerance=1e-2)` all
+10 are closed faces and the bounded area more than doubles:
+
+![raw exact vs. snapped vs. snapped + dangling edges removed](images/tst_cleanup_compare.png)
+
+CGAL itself offers only grid *snap rounding* (`Snap_rounding_2`, which moves every vertex
+to a pixel grid and closes gaps smaller than a pixel as a side effect) and polygon repair
+for closed polygons, neither of which is a substitute for tolerance-based snapping of a
+segment soup.
+
 ## 15. Plotting
 
 `arrangement_2d.plot` is a thin matplotlib layer. matplotlib is imported inside the
