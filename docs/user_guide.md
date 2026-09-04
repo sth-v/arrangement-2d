@@ -767,12 +767,14 @@ its neighbour or into the unbounded face, and "the big faces are never found".
 ```python
 from arrangement_2d import cleanup, regions
 
-segs = [((x1, y1), (x2, y2)), ...]            # or cleanup.segments_from_polylines(polylines)
+# a square whose last corner misses the first by 1e-9, plus a chord that misses the bottom
+# edge by 1e-9 and an isolated stray piece (in real life: cleanup.segments_from_polylines(...))
+segs = [((0, 0), (4, 0)), ((4, 0), (4, 4)), ((4, 4), (0, 4)), ((0, 4), (0, 1e-9)),
+        ((2, 1e-9), (2, 4)), ((7, 7), (8, 8))]
 
 print(cleanup.near_miss_report(segs))          # how many endpoint / T-junction gaps at each tolerance
-arr = cleanup.clean_arrangement(segs, tolerance=1e-2)     # snap, build exactly, drop dangling edges
-for face in regions.bounded_faces(arr):
-    print(regions.face_area(face))
+arr = cleanup.clean_arrangement(segs, tolerance=1e-6)     # snap, build exactly, drop dangling edges
+print([regions.face_area(face) for face in regions.bounded_faces(arr)])   # [Fraction(8, 1), Fraction(8, 1)]
 ```
 
 * `near_miss_report(segs)` tells you, for several tolerances, how many endpoints almost
