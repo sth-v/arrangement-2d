@@ -58,7 +58,7 @@ def discover():
         prefixes += ["/opt/homebrew", "/usr/local"]
     prefixes += ["/usr/local", "/usr"]
 
-    include_dirs = [str(INCLUDE), str(HERE / "arrangement_2d")]   # arr2d headers + _exc_bridge.hpp
+    include_dirs = ["src/arr2d/include", "arrangement_2d"]   # arr2d headers + _exc_bridge.hpp (relative to setup.py)
     library_dirs = []
 
     cgal_inc = os.environ.get("CGAL_INCLUDE_DIR") or _first_existing(
@@ -119,8 +119,11 @@ def link_args():
 
 include_dirs, library_dirs, libraries = discover()
 
-cpp_sources = sorted(glob.glob(str(SRC / "src" / "*.cpp")))
-pyx = str(HERE / "arrangement_2d" / "_core.pyx")
+# setuptools (and pip's editable-wheel builder in particular) require every source path to be
+# a /-separated path RELATIVE to the setup.py directory; absolute paths are rejected.
+os.chdir(HERE)
+cpp_sources = sorted(os.path.relpath(f, HERE).replace(os.sep, "/") for f in glob.glob(str(SRC / "src" / "*.cpp")))
+pyx = "arrangement_2d/_core.pyx"
 
 ext = Extension(
     "arrangement_2d._core",
@@ -194,7 +197,7 @@ if os.environ.get("ARR2D_PROFILE") == "1":
 
 setup(
     ext_modules=cythonize([ext], compiler_directives=directives, nthreads=int(os.environ.get("ARR2D_JOBS", os.cpu_count() or 1)),
-                          include_path=[str(HERE / "arrangement_2d")]),
+                          include_path=["arrangement_2d"]),
     cmdclass={"build_ext": build_ext},
     package_data={"arrangement_2d": ["*.pyx", "*.pxd", "*.pxi", "*.hpp", "py.typed"]},
     zip_safe=False,
