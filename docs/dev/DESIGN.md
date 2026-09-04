@@ -230,7 +230,7 @@ arr.remove_curve(curve_handle) -> int (number of removed edges)
 # queries
 arr.locate(point, strategy=None) -> Vertex | Halfedge | Face
 arr.ray_shoot_up(point, strategy=None) / ray_shoot_down -> Vertex | Halfedge | Face | None
-arr.batched_locate(points) -> [(Point, result)]
+arr.batched_locate(points) -> [result, ...] aligned with the input points
 arr.attach_point_location(strategy) / detach_point_location(strategy) ; strategies: "naive","simple","walk","landmarks","trapezoid","triangulation"
 arr.zone(curve) -> [Vertex | Halfedge | Face] ; arr.do_intersect(curve) -> bool
 arr.decompose() -> [(Vertex, below, above)]   (vertical decomposition; below/above are Vertex|Halfedge|Face|None)

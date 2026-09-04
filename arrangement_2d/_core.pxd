@@ -119,10 +119,12 @@ cdef extern from "arr2d/common.hpp" namespace "arr2d":
 
 
 cdef extern from "arr2d/numbers.hpp" namespace "arr2d":
+    # NOTE: for `cdef enum class`, Cython emits <enum cname>::<member cython name> and ignores
+    # per-member cnames, so member names must match the C++ enumerators exactly.
     cdef enum class NumberKind "arr2d::NumberKind":
-        NRational "arr2d::NumberKind::Rational"
-        NSqrtExt "arr2d::NumberKind::SqrtExt"
-        NAlgebraic "arr2d::NumberKind::Algebraic"
+        Rational "arr2d::NumberKind::Rational"
+        SqrtExt "arr2d::NumberKind::SqrtExt"
+        Algebraic "arr2d::NumberKind::Algebraic"
 
     cdef cppclass SqrtExt:
         Rational a

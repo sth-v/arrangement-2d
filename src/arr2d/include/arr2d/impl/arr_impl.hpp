@@ -508,8 +508,12 @@ class ArrImpl final : public ArrBase {
     Geom c = box_xcurve(base);
     const bool curve_l2r = (ops().compare_endpoints_xy(c) == -1);
     const bool he_l2r = (e->direction() == CGAL::ARR_LEFT_TO_RIGHT);
-    if (curve_l2r != he_l2r) return ops().construct_opposite(c);   // Unsupported propagates
-    return c;
+    if (curve_l2r == he_l2r) return c;
+    // Unbounded curves (Linear rays/lines) cannot always be reversed (a reversed ray is not a
+    // ray in Arr_linear_object_2): return the curve as stored and let callers consult
+    // he_direction() — documented contract in arrangement.hpp.
+    if (!ops().curve_is_bounded(c)) return c;
+    return ops().construct_opposite(c);   // Unsupported propagates for other kinds
   }
 
   int he_direction(HH h) const override {
@@ -594,6 +598,28 @@ class ArrImpl final : public ArrBase {
   }
 
   // ---- Arrangement_2 modification (specialised, unchecked insertions) ----
+  //
+  // These map 1:1 to the Arrangement_on_surface_2 members.  They do NO point location and NO
+  // intersection test; every CGAL precondition below is checked by CGAL only when assertions are
+  // enabled (the project keeps -UNDEBUG, so they raise CGAL::Precondition_exception):
+  //   * insert_point_in_face_interior(p, f): p must lie inside f (not checked by CGAL at all).
+  //   * insert_in_face_interior(cv, f): cv's interior must be disjoint from the arrangement and
+  //     lie inside f; both endpoints are created as new vertices.
+  //   * insert_from_left_vertex(cv, v) / insert_from_right_vertex(cv, v): v must be the left
+  //     (resp. right) end of cv.  CGAL additionally requires a containing face argument when v
+  //     has degree 0 and carries no isolated-vertex record — that overload is not exposed here,
+  //     so pass an isolated or an incident vertex.
+  //   * insert_at_vertices(cv, v1, v2): v1 and v2 must be cv's endpoints, cv must not intersect
+  //     the arrangement, and (when both are isolated) they must lie in the same face.
+  //   * modify_vertex(v, p) / modify_edge(h, cv): p (cv) must be geometrically EQUAL to the
+  //     current point (curve); v must not lie on an open boundary, h must not be fictitious.
+  //   * split_edge(h, cv1, cv2): cv1/cv2 must be the two halves of h's curve sharing the split
+  //     point.  merge_edge(h1, h2, cv): h1 and h2 must share a degree-2 vertex not on an open
+  //     boundary, and cv must be their union.
+  //   * remove_isolated_vertex(v): v must be isolated (checked here as well).
+  // None of them record anything in the curve history (the curve is not an input curve); the two
+  // exceptions are split_edge/merge_edge/modify_edge, which carry the ORIGINAL edge's
+  // originating-curve set over to the new curve so that the history stays consistent.
   VH insert_point_in_face_interior(const Geom& p, FH f) override {
     sync();
     FHandle fh = check_f(f);
@@ -656,7 +682,12 @@ class ArrImpl final : public ArrBase {
     if (a->is_fictitious() || b->is_fictitious())
       throw_error(ErrorCode::InvalidArgument, "cannot merge fictitious edges");
     DXcv cv(xcurve_in(xc), a->curve().data());
-    return track_h(m_arr.Base_arr::merge_edge(a, b, cv));
+    HHandle m = m_arr.Base_arr::merge_edge(a, b, cv);
+    // CGAL returns a default-constructed (unusable) handle when the two edges share no vertex and
+    // preconditions are compiled out (arrangement_core.md §6.13) — never dereference that.
+    if (m == HHandle())
+      throw_error(ErrorCode::InvalidArgument, "merge_edge: the two edges do not share a vertex");
+    return track_h(m);
   }
   FH remove_edge(HH h, bool remove_source, bool remove_target) override {
     sync();
@@ -922,6 +953,10 @@ class ArrImpl final : public ArrBase {
   Located ray_shoot_up(const Geom& p, int strategy) const override { return ray_shoot(p, strategy, true); }
   Located ray_shoot_down(const Geom& p, int strategy) const override { return ray_shoot(p, strategy, false); }
 
+  /// CGAL precondition (sphere kind): the batched sweep compares points with the traits'
+  /// Compare_x_2, which requires `p.is_no_boundary()` — a spherical arrangement with a vertex on
+  /// a pole or on the identification curve makes CGAL raise a precondition failure (which
+  /// propagates as CGAL::Precondition_exception).  Planar kinds are unrestricted.
   void batched_locate(const std::vector<Geom>& pts, std::vector<Located>& out) const override {
     sync();
     out.assign(pts.size(), Located::none());
@@ -986,6 +1021,10 @@ class ArrImpl final : public ArrBase {
     return CGAL::do_intersect(m_arr, Data_curve_2(cv, nullptr), pl);
   }
 
+  /// CGAL precondition (sphere kind): same restriction as batched_locate() — the vertical
+  /// decomposition sweep calls Compare_x_2 on every vertex, which requires that no vertex lies on
+  /// a pole or on the identification curve.  Verified: a spherical triangle inside one octant
+  /// decomposes fine, one with a vertex at the north pole raises the CGAL precondition.
   void decompose(std::vector<VerticalDecompositionEntry>& out) const override {
     sync();
     using Cell = std::variant<VCHandle, HCHandle, FCHandle>;
@@ -1227,7 +1266,7 @@ class ArrImpl final : public ArrBase {
   // after_clear / after_assign / after_attach / after_global_change, because the aggregate sweep
   // insertions build the DCEL without a usable per-element notification stream.  It is deferred
   // (m_dirty) so that a loop of N insertions does not cost O(N * size).
-  void sync() const { if (m_dirty) rescan(); }
+  void sync() const { if (m_dirty && m_in_notify == 0) rescan(); }
 
   void rescan() const {
     m_dirty = false;
@@ -1422,11 +1461,20 @@ class ArrImpl final : public ArrBase {
     ObserverFn fn;
   };
 
+  /// RAII: while a Python callback runs, sync() must not rescan — the DCEL can be in an
+  /// intermediate state in the middle of a CGAL operation and a CCB walk could then loop.
+  struct NotifyGuard {
+    const ArrImpl* self;
+    explicit NotifyGuard(const ArrImpl* s) : self(s) { ++s->m_in_notify; }
+    ~NotifyGuard() { --self->m_in_notify; }
+  };
+
   void notify(const ObsEventData& ev) const {
     if (m_py_obs.empty()) return;
     // The callbacks are void and never throw (Cython records the Python exception); copy the list
     // so that add_observer/remove_observer from inside a callback is safe.
     std::vector<PyObserver> snapshot = m_py_obs;
+    NotifyGuard guard(this);
     for (const PyObserver& o : snapshot)
       if (o.fn) o.fn(o.user, ev);
   }
@@ -1551,7 +1599,10 @@ class ArrImpl final : public ArrBase {
       m_self->m_live_h.clear();
       m_self->m_live_f.clear();
       m_self->m_curve_ids.clear();
-      m_self->m_dirty = false;
+      // clear() re-initialises the DCEL: under the unbounded topology that silently re-creates
+      // the fictitious face, its 4 corner vertices and 8 fictitious halfedges without any
+      // notification, so the fresh skeleton has to be rescanned.
+      m_self->m_dirty = true;
       m_self->notify(mk(ObsEvent::AfterClear));
     }
     void before_global_change() override { m_self->notify(mk(ObsEvent::BeforeGlobalChange)); }
@@ -1925,6 +1976,7 @@ class ArrImpl final : public ArrBase {
   mutable std::unordered_map<const void*, std::uint64_t> m_curve_ids;
   mutable std::uint64_t m_next_id = 1;
   mutable bool m_dirty = false;
+  mutable int m_in_notify = 0;      ///< > 0 while a Python observer callback is running
   mutable const KindOps* m_ops = nullptr;
 
   std::vector<PyObserver> m_py_obs;

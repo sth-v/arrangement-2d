@@ -21,8 +21,10 @@ def main():
         res = rec.get("result")
         if not isinstance(res, dict) or "summary" not in res:
             continue
-        label = rec.get("label") or rec.get("agentLabel") or rec.get("name") or "agent"
         files = res.get("files_written") or []
+        import os
+        label = rec.get("label") or rec.get("agentLabel") or rec.get("name") or (
+            ", ".join(os.path.basename(f) for f in files[:3]) + (" ..." if len(files) > 3 else "")) or "agent"
         parts.append(f"\n## {label}\n")
         parts.append("**Files:** " + ", ".join(f"`{f}`" for f in files) + "\n")
         parts.append("\n### Summary\n\n" + str(res.get("summary", "")).strip() + "\n")

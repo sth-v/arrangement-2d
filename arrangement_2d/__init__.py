@@ -70,6 +70,7 @@ from ._core import (
     Ray,
     Segment,
     conic_allow_hyperbolic,
+    line_from_coefficients,
     # ---- arrangement ---------------------------------------------------------
     Arrangement,
     CurveHandle,
@@ -89,6 +90,8 @@ from ._core import (
     join,
     oriented_side,
     symmetric_difference,
+    is_valid_polygon,
+    orientation,
 )
 from .errors import (
     CallbackError,
@@ -153,6 +156,7 @@ __all__ = [
     "Polygon",
     "PolygonWithHoles",
     "conic_allow_hyperbolic",
+    "line_from_coefficients",
     # arrangement
     "Arrangement",
     "Vertex",
@@ -172,6 +176,8 @@ __all__ = [
     "complement",
     "do_intersect",
     "oriented_side",
+    "is_valid_polygon",
+    "orientation",
     # errors
     "CGALError",
     "PreconditionError",

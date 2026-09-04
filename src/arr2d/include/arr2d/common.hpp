@@ -208,6 +208,10 @@ inline bool operator==(const VH& a, const VH& b) { return a.p == b.p && a.id == 
 inline bool operator==(const HH& a, const HH& b) { return a.p == b.p && a.id == b.id; }
 inline bool operator==(const FH& a, const FH& b) { return a.p == b.p && a.id == b.id; }
 inline bool operator==(const CH& a, const CH& b) { return a.p == b.p && a.id == b.id; }
+inline bool operator!=(const VH& a, const VH& b) { return !(a == b); }
+inline bool operator!=(const HH& a, const HH& b) { return !(a == b); }
+inline bool operator!=(const FH& a, const FH& b) { return !(a == b); }
+inline bool operator!=(const CH& a, const CH& b) { return !(a == b); }
 
 /// Result of point location / ray shooting / zone: one of vertex, halfedge, face, or none.
 struct Located {

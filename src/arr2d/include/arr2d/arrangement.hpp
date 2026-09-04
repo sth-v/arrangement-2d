@@ -193,7 +193,10 @@ class ArrBase {
   virtual HH he_prev(HH h) const = 0;
   virtual FH he_face(HH h) const = 0;                             ///< incident face (to the left)
   virtual Geom he_curve(HH h) const = 0;                          ///< the stored x-monotone curve (shared with the twin); Unsupported for fictitious halfedges
-  virtual Geom he_directed_curve(HH h) const = 0;                 ///< the curve oriented from he_source to he_target (Construct_opposite_2 when needed)
+  /// The curve oriented from he_source to he_target (Construct_opposite_2 when needed).
+  /// Exception: unbounded curves (Linear rays/lines) are returned AS STORED because a reversed
+  /// ray is not representable; consult he_direction() for those.
+  virtual Geom he_directed_curve(HH h) const = 0;
   virtual int he_direction(HH h) const = 0;                       ///< HalfedgeDirection
   virtual bool he_is_fictitious(HH h) const = 0;
   virtual bool he_is_on_inner_ccb(HH h) const = 0;

@@ -58,7 +58,7 @@ def discover():
         prefixes += ["/opt/homebrew", "/usr/local"]
     prefixes += ["/usr/local", "/usr"]
 
-    include_dirs = [str(INCLUDE)]
+    include_dirs = [str(INCLUDE), str(HERE / "arrangement_2d")]   # arr2d headers + _exc_bridge.hpp
     library_dirs = []
 
     cgal_inc = os.environ.get("CGAL_INCLUDE_DIR") or _first_existing(
@@ -162,6 +162,6 @@ setup(
     ext_modules=cythonize([ext], compiler_directives=directives, nthreads=int(os.environ.get("ARR2D_JOBS", os.cpu_count() or 1)),
                           include_path=[str(HERE / "arrangement_2d")]),
     cmdclass={"build_ext": build_ext},
-    package_data={"arrangement_2d": ["*.pyx", "*.pxd", "py.typed"]},
+    package_data={"arrangement_2d": ["*.pyx", "*.pxd", "*.pxi", "*.hpp", "py.typed"]},
     zip_safe=False,
 )

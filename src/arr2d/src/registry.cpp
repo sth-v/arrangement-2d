@@ -1,5 +1,6 @@
 // arr2d — kind registry implementation + small shared helpers from common.hpp.
 #include "arr2d/registry.hpp"
+#include "arr2d/arrangement.hpp"
 
 #include <CGAL/version.h>
 #include <CGAL/Exact_rational.h>
@@ -66,6 +67,80 @@ void set_pyobject_hooks(PyObjectHook incref, PyObjectHook decref) {
 }
 void pyobject_incref(void* obj) { if (obj && g_incref) g_incref(obj); }
 void pyobject_decref(void* obj) { if (obj && g_decref) g_decref(obj); }
+
+// ---- arrangement.hpp: observer event names (generated from the ObsEvent enum order) ----
+namespace {
+const char* const kObsEventNames[] = {
+    "before_assign",
+    "after_assign",
+    "before_clear",
+    "after_clear",
+    "before_global_change",
+    "after_global_change",
+    "before_attach",
+    "after_attach",
+    "before_detach",
+    "after_detach",
+    "before_create_vertex",
+    "after_create_vertex",
+    "before_create_boundary_vertex",
+    "after_create_boundary_vertex",
+    "before_create_edge",
+    "after_create_edge",
+    "before_modify_vertex",
+    "after_modify_vertex",
+    "before_modify_edge",
+    "after_modify_edge",
+    "before_split_edge",
+    "after_split_edge",
+    "before_split_fictitious_edge",
+    "after_split_fictitious_edge",
+    "before_split_face",
+    "after_split_face",
+    "before_split_outer_ccb",
+    "after_split_outer_ccb",
+    "before_split_inner_ccb",
+    "after_split_inner_ccb",
+    "before_add_outer_ccb",
+    "after_add_outer_ccb",
+    "before_add_inner_ccb",
+    "after_add_inner_ccb",
+    "before_add_isolated_vertex",
+    "after_add_isolated_vertex",
+    "before_merge_edge",
+    "after_merge_edge",
+    "before_merge_fictitious_edge",
+    "after_merge_fictitious_edge",
+    "before_merge_face",
+    "after_merge_face",
+    "before_merge_outer_ccb",
+    "after_merge_outer_ccb",
+    "before_merge_inner_ccb",
+    "after_merge_inner_ccb",
+    "before_move_outer_ccb",
+    "after_move_outer_ccb",
+    "before_move_inner_ccb",
+    "after_move_inner_ccb",
+    "before_move_isolated_vertex",
+    "after_move_isolated_vertex",
+    "before_remove_vertex",
+    "after_remove_vertex",
+    "before_remove_edge",
+    "after_remove_edge",
+    "before_remove_outer_ccb",
+    "after_remove_outer_ccb",
+    "before_remove_inner_ccb",
+    "after_remove_inner_ccb"
+};
+static_assert(sizeof(kObsEventNames) / sizeof(kObsEventNames[0]) == std::size_t(ObsEvent::NumEvents),
+              "kObsEventNames must list every ObsEvent in enum order");
+}  // namespace
+
+const char* obs_event_name(ObsEvent e) {
+  int i = int(e);
+  if (i < 0 || i >= int(ObsEvent::NumEvents)) return "?";
+  return kObsEventNames[i];
+}
 
 // ---- registry ----
 void register_kind(Kind k, const KindEntry& entry) { table()[int(k)] = entry; }
