@@ -455,6 +455,71 @@ class SphereOps final : public KindOpsBase<SphereTypes> {
   bool xcurve_has_source(const Geom& xc) const override { in_xcurve(xc); return true; }
   bool xcurve_has_target(const Geom& xc) const override { in_xcurve(xc); return true; }
 
+  /// CGAL 6.1 bug workaround.  An `Arr_x_monotone_geodesic_arc_on_sphere_3` is "the arc swept
+  /// counterclockwise around `normal` from `source` to `target`": every constructor establishes
+  /// `normal == source x target` for a minor arc, and `Compare_y_at_x_2` reads the pair
+  /// (`normal`, `is_directed_right`) together
+  /// (Arr_geodesic_arc_on_sphere_traits_2.h:1200-1205).  `X_monotone_curve_2::opposite()`
+  /// (same header, :3454) swaps source/target and flips `is_directed_right` but KEEPS the
+  /// normal, so the arc it returns describes the COMPLEMENTARY arc: measured on the 90-degree
+  /// arc (1,0,0)->(0,1,0), the CGAL opposite approximates to 3*pi/2 of great circle and answers
+  /// `compare_y_at_x` with the inverted sign.  `Construct_opposite_2` just forwards to it
+  /// (:3019), so the fix belongs here: rebuild the arc with the NEGATED normal, which restores
+  /// `normal == source x target` and therefore every predicate, the approximation, the bbox and
+  /// `Halfedge.directed_curve`.
+  /// CGAL 6.1 `Equal_2` identifies a MERIDIAN (a pole-to-pole arc — every meridian has the
+  /// same two endpoints, so the endpoints cannot tell them apart) by its NORMAL alone
+  /// (Arr_geodesic_arc_on_sphere_traits_2.h:1478-1481).  That is both too lax and too strict:
+  /// the two complementary halves of a vertical great circle are built with the SAME normal
+  /// (:2123-2124) and would compare equal although they are disjoint, while a meridian and its
+  /// reverse — the same point set — carry OPPOSITE normals under the "counterclockwise around
+  /// `normal` from `source` to `target`" invariant (see construct_opposite above).  A meridian
+  /// is identified exactly by the direction `normal x source`, i.e. by its own midpoint;
+  /// compare that instead.
+  ///
+  /// The NON-meridian branch (:1483-1484) compares nothing but `left()` and `right()`, which
+  /// identifies the arc only while the two endpoints are NOT ANTIPODAL: through two
+  /// non-antipodal points there is exactly one great circle, and of its two complementary arcs
+  /// only the minor one can be x-monotone (the major one spans more than 180 degrees of
+  /// longitude, so it must cross the identification curve and would have been split).  An
+  /// ANTIPODAL pair leaves the whole pencil of great circles through it, each contributing one
+  /// x-monotone half circle.  Measured: the two arcs (0,-1,0) -> (0,1,0) with normals (0,0,1)
+  /// and (1,0,1) share nothing but their endpoints — their midpoints are (1,0,0) and
+  /// (1,0,-1)/sqrt 2 — and CGAL 6.1 calls them EQUAL.  The supporting great circle is exactly
+  /// the normal up to sign (the same graph traversed backwards carries the NEGATED normal under
+  /// the invariant `normal == source x target`, see construct_opposite above), so compare that
+  /// as well.  For every non-antipodal pair the extra test is implied by the endpoints and
+  /// changes no answer.
+  bool curve_equal(const Geom& a, const Geom& b) const override {
+    const X_monotone_curve_2& x = xcurve(a);
+    const X_monotone_curve_2& y = xcurve(b);
+    if (x.is_full() || y.is_full()) return KindOpsBase<SphereTypes>::curve_equal(a, b);
+    const Kernel& k = tr();
+    auto eq3 = k.equal_3_object();
+    if (x.is_meridian() || y.is_meridian()) {
+      if (!x.is_meridian() || !y.is_meridian()) return false;
+      const Direction_3 mx(CGAL::cross_product(x.normal().vector(),
+                                               as_direction(x.source()).vector()));
+      const Direction_3 my(CGAL::cross_product(y.normal().vector(),
+                                               as_direction(y.source()).vector()));
+      return eq3(mx, my);
+    }
+    if (!KindOpsBase<SphereTypes>::curve_equal(a, b)) return false;
+    // A degenerate arc is a single point and has no supporting great circle to compare.
+    if (x.is_degenerate() || y.is_degenerate()) return true;
+    auto opp3 = k.construct_opposite_direction_3_object();
+    return eq3(x.normal(), y.normal()) || eq3(opp3(x.normal()), y.normal());
+  }
+
+  Geom construct_opposite(const Geom& xc) const override {
+    const Xcv& c = in_xcurve(xc);
+    const Kernel& k = tr();   // the traits derives from the kernel (§4.2)
+    auto opp = k.construct_opposite_direction_3_object();
+    return box_xcurve(Xcv(c.target(), c.source(), opp(c.normal()), c.is_vertical(),
+                          !c.is_directed_right(), c.is_full(), c.is_degenerate(),
+                          c.is_empty()));
+  }
+
   /// 3-D axis-aligned box (BBox::dim == 3) of the polyline approximation, in unit-sphere
   /// coordinates.  Arr_x_monotone_geodesic_arc_on_sphere_3::bbox() is `#if 0`-ed out in CGAL 6.1
   /// (traits_geodesic_sphere.md §2), so there is nothing exact to call.
@@ -656,9 +721,12 @@ Geom normal(const Geom& c) {
 // 4. Explicit instantiation of the generic arrangement implementation
 // ===========================================================================
 //
-// KindPolicy<SphereTypes> is already specialised in impl/arr_impl.hpp (naive + landmarks point
-// location only; no simple/walk/trapezoid/triangulation, no vertical ray shooting, member
-// is_valid() instead of the free CGAL::is_valid) — a kind TU adds nothing here.
+// KindPolicy<SphereTypes> is already specialised in impl/arr_impl.hpp (naive point location only;
+// no simple/walk/trapezoid/triangulation, no landmarks — it compiles but its walk joins the query
+// point to the nearest landmark with Construct_x_monotone_curve_2, whose precondition forbids an
+// antipodal pair (Arr_geodesic_arc_on_sphere_traits_2.h:611) and CGAL picks the landmark; no
+// vertical ray shooting, member is_valid() instead of the free CGAL::is_valid) — a kind TU adds
+// nothing here.
 template class ArrImpl<SphereTypes>;
 
 // ===========================================================================

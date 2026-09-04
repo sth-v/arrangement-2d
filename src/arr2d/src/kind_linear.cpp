@@ -7,9 +7,12 @@
 //   4. the explicit instantiation of ArrImpl<LinearTypes>,
 //   5. the static registrar that publishes the kind in the registry.
 //
-// KindPolicy<LinearTypes> is already specialised in impl/arr_impl.hpp (naive / simple / walk /
-// landmarks / trapezoid supported, triangulation NOT — it calls point() on vertices at infinity,
-// point_location_and_decomposition.md gotcha 9), so this TU adds no policy specialisation.
+// KindPolicy<LinearTypes> is already specialised in impl/arr_impl.hpp (naive / simple / walk
+// supported; landmarks supported but gated at RUNTIME by ArrImpl::landmarks_usable() on
+// "no unbounded edge in this arrangement"; trapezoid NOT — an attached RIC structure asserts when
+// an edge incident to a vertex at infinity is removed; triangulation NOT — it calls point() on
+// vertices at infinity, point_location_and_decomposition.md gotcha 9), so this TU adds no policy
+// specialisation.
 //
 // ---------------------------------------------------------------------------------------------
 // CGAL 6.1 traps handled here (docs/dev/CGAL_TRAPS_CHECKLIST.md); every workaround is also
@@ -374,10 +377,15 @@ class LinearOps final : public KindOpsBase<LinearTypes> {
     const RatBox rb = exact_bbox(cv);
     BBox b;
     b.dim = 2;
-    b.lo[0] = rb.xlo_inf ? -kInf : to_double_correctly_rounded(rb.xlo);
-    b.hi[0] = rb.xhi_inf ? kInf : to_double_correctly_rounded(rb.xhi);
-    b.lo[1] = rb.ylo_inf ? -kInf : to_double_correctly_rounded(rb.ylo);
-    b.hi[1] = rb.yhi_inf ? kInf : to_double_correctly_rounded(rb.yhi);
+    // Round OUTWARD, as every other bounded kind does (kind_segment.cpp uses interval_of the same
+    // way, conic widens by 4 ulps, the polyline kind inherits CGAL's to_interval-based bbox).
+    // to_double_correctly_rounded() rounds to NEAREST, so an upper bound whose exact value is not
+    // a double came back rounded DOWN and the box then EXCLUDED part of its own curve — which
+    // matters because approximate(tolerance, bbox=...) clips unbounded linear curves against it.
+    b.lo[0] = rb.xlo_inf ? -kInf : interval_of(rb.xlo).first;
+    b.hi[0] = rb.xhi_inf ? kInf : interval_of(rb.xhi).second;
+    b.lo[1] = rb.ylo_inf ? -kInf : interval_of(rb.ylo).first;
+    b.hi[1] = rb.yhi_inf ? kInf : interval_of(rb.yhi).second;
     return b;
   }
 

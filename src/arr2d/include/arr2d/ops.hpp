@@ -136,6 +136,40 @@ class KindOps {
   virtual Geom construct_x_monotone_curve(const Geom& p, const Geom& q) const = 0;
   /// Approximate_2 on a point coordinate i (0/1/2).
   virtual double approximate_coordinate(const Geom& p, int i) const = 0;
+
+  // ---------------------------------------------------------------- sweep pre-flight
+  /// Whether check_sweepable() has anything to say for this kind.  False everywhere but
+  /// Kind::Bezier, so that ArrImpl can skip gathering the arrangement's curves (an O(E) walk)
+  /// for every other kind.  Constant for the lifetime of the process.
+  virtual bool needs_sweep_precheck() const = 0;
+  /// Pre-flight guard for CGAL 6.1 sweep bugs that CORRUPT MEMORY instead of raising, run
+  /// before a set of curves is handed to CGAL's sweep / zone machinery.  `curves` is the whole
+  /// set that will meet inside CGAL — the arrangement's edge curves plus the curves being
+  /// inserted or queried (Curve and XCurve boxes are both accepted).  Throws
+  /// Error(Unsupported) for a combination CGAL 6.1 cannot handle; a no-op unless
+  /// needs_sweep_precheck() is true.
+  ///
+  /// BEZIER: refuses two DISTINCT supporting curves of which one passes through the other's
+  /// own SELF-intersection point.  `_Bezier_cache::get_intersections` pairs the two curves'
+  /// resultant roots assuming the two root lists have equal length; a self-intersection point
+  /// is reached at two parameters, so they do not, the shorter list runs empty and an unsigned
+  /// loop counter wraps to 4294967295 and indexes an empty vector (Bezier_cache.h:458/488).
+  /// See docs/dev/CGAL_TRAPS_CHECKLIST.md, "Bezier kind".
+  virtual void check_sweepable(const std::vector<Geom>& curves) const = 0;
+  /// Identity of the SUPPORTING curve an x-monotone curve was cut from, or 0 when the kind has
+  /// no such notion (every kind but Bezier, and every kind whose needs_sweep_precheck() is
+  /// false).  It exists so that the operations whose CGAL precondition is "the supplied
+  /// x-monotone curves are pieces of the edge curve they replace" — modify_edge, split_edge,
+  /// merge_edge — can verify that precondition in O(1) instead of running the O(E)
+  /// check_sweepable() pre-flight: a piece of a supporting curve that the arrangement already
+  /// holds cannot create a new dangerous PAIR, and a caller that supplies something else gets
+  /// the full pre-flight rather than undefined behaviour.  Ids are only ever compared for
+  /// equality and are stable for as long as the supporting curve is alive (the Bezier kind
+  /// retains every curve rep for the life of the process, see kind_bezier.cpp).
+  virtual std::uint64_t supporting_curve_id(const Geom& xcurve) const {
+    (void)xcurve;
+    return 0;
+  }
 };
 
 // ===========================================================================

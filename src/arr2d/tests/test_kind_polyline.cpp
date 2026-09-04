@@ -630,18 +630,42 @@ static void test_approximate() {
   check(O().curve_is_bounded(xc) && O().curve_is_bounded(PL({{0, 0}, {1, 1}})),
         "every polyline is bounded");
 
-  // approximate_coordinate is DELIBERATELY the raw traits functor (ops.hpp: "Approximate_2 on a
-  // point coordinate i"; the Python facade spells it Traits.approximate_point).  It uses
-  // CGAL::to_double(Epeck::FT) and may therefore be one ulp off, unlike point_approx().
+  // REGRESSION (ops.hpp contract "approximate_coordinate agrees with point_approx"):
+  // KindOpsBase used to forward to the traits' Approximate_2, which is
+  // CGAL::to_double(Epeck::FT) and is NOT correctly rounded — for x = 1/3 it returns
+  // 0.33333333333333337 where the nearest double is 0.33333333333333331.  It now delegates to
+  // point_approx() for every kind, so the two can never disagree again.
   check_close(O().approximate_coordinate(P(3, 7), 0), 3.0, 0.0, "approximate_coordinate(x)");
   check_close(O().approximate_coordinate(P(3, 7), 1), 7.0, 0.0, "approximate_coordinate(y)");
   {
-    const Geom third = Pr(R(1, 3), R(0));
-    const double raw = O().approximate_coordinate(third, 0);
-    const double rounded = xy(third).first;
-    std::printf("    Approximate_2(1/3) = %.17g ; point_approx(1/3) = %.17g\n", raw, rounded);
-    check(rounded == 1.0 / 3.0, "point_approx(1/3) is the correctly rounded double");
-    check(std::fabs(raw - rounded) <= 1e-16, "the raw traits functor is within an ulp of it");
+    const Geom third = Pr(R(1, 3), R(2, 7));
+    const double ax = O().approximate_coordinate(third, 0);
+    const double ay = O().approximate_coordinate(third, 1);
+    const std::pair<double, double> pa = xy(third);
+    std::printf("    approximate_coordinate(1/3) = %.17g ; point_approx(1/3) = %.17g\n", ax, pa.first);
+    check(pa.first == 1.0 / 3.0, "point_approx(1/3) is the correctly rounded double");
+    check(ax == pa.first, "approximate_coordinate(x) == point_approx(x) (correctly rounded)");
+    check(ay == pa.second, "approximate_coordinate(y) == point_approx(y) (correctly rounded)");
+  }
+
+  // REGRESSION (ops.hpp contract "every output vector is CLEARED first"): make_x_monotone() and
+  // intersect() used to APPEND, so a reused vector silently accumulated results.
+  {
+    const Geom zig = PL({{0, 0}, {2, 2}, {1, 0}});     // 2 x-monotone pieces
+    std::vector<Geom> out;
+    O().make_x_monotone(zig, out);
+    const std::size_t n1 = out.size();
+    O().make_x_monotone(zig, out);                     // same vector, second call
+    check_eq_sz(out.size(), n1, "make_x_monotone clears its output vector");
+
+    const Geom a = PL({{0, 0}, {4, 4}});
+    const Geom b = PL({{0, 4}, {4, 0}});
+    std::vector<IntersectionResult> ir;
+    O().intersect(O().to_x_monotone(a), O().to_x_monotone(b), ir);
+    const std::size_t m1 = ir.size();
+    check_eq_sz(m1, 1, "the two diagonals cross once");
+    O().intersect(O().to_x_monotone(a), O().to_x_monotone(b), ir);
+    check_eq_sz(ir.size(), m1, "intersect clears its output vector");
   }
   expect_error(ErrorCode::InvalidArgument, [&] { (void)O().approximate_coordinate(P(3, 7), 2); },
                "approximate_coordinate rejects index 2 for a planar kind");

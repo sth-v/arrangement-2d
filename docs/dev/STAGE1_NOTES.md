@@ -208,7 +208,7 @@ No temporaries were written into the repo (`git status` shows only my two commit
 - `PolygonSet.insert()` uses `PolygonSetBase::insert` / `insert_polygons`, so the CGAL disjointness precondition applies; the *operand conversion* used by `join/intersection/...` and by the module-level helpers builds its temporary set with repeated `join_polygon` instead, so overlapping inputs are accepted there. Documented in both docstrings.
 - Ambiguity resolution for `PolygonSet.insert(x)` / the Boolean helpers: a bare flat sequence of points or curves is one polygon; a sequence whose first element is itself point-like/curve-like/Polygon-like (`_is_ringish`) is a sequence of rings. Deeply mixed nestings beyond 8 levels raise TypeError.
 - The runtime smoke test only covers the SEGMENT kind (the fake core implements only that one). Every other kind was exercised only along its error path. The real per-kind behaviour (circle-segment sqrt endpoints, Bezier originators, conic coefficient round-trips, sphere directions) still needs tests once the C++ kind TUs exist.
-- `Curve.__eq__` catches `NotXMonotoneError` and returns `NotImplemented` when either operand cannot be promoted to x-monotone; Python then falls back to identity. This path was compiled but not exercised at runtime (the fake core has no non-x-monotone curves).
+- `Curve.__eq__` catches `NotXMonotoneError` when either operand cannot be promoted to a single x-monotone curve (a full circle, a self-intersecting Bezier curve, a multi-piece conic arc) and then compares the two `Make_x_monotone_2` decompositions PIECEWISE. (It used to return `NotImplemented` there, which silently degraded to identity comparison — two equal circles compared unequal.)
 
 
 ## _core.pyx, _errors.pxi, _numbers.pxi ...

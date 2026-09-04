@@ -114,9 +114,20 @@ _LAZY_SUBMODULES = ("regions", "plot")
 
 
 def __getattr__(name: str) -> Any:
-    """Import ``arrangement_2d.regions`` / ``arrangement_2d.plot`` on first access (PEP 562)."""
+    """Import ``arrangement_2d.regions`` / ``arrangement_2d.plot`` on first access (PEP 562).
+
+    Both are optional add-ons that may not be installed; a missing one raises
+    :class:`AttributeError` (not :class:`ModuleNotFoundError`) so that ``hasattr`` and
+    ``from arrangement_2d import *`` behave.
+    """
     if name in _LAZY_SUBMODULES:
-        module = importlib.import_module("." + name, __name__)
+        try:
+            module = importlib.import_module("." + name, __name__)
+        except ModuleNotFoundError as exc:  # the optional submodule is not installed
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r} "
+                f"(the optional submodule arrangement_2d.{name} is not installed)"
+            ) from exc
         globals()[name] = module
         return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -190,7 +201,8 @@ __all__ = [
     "NotRepresentableError",
     "UnsupportedError",
     "CallbackError",
-    # lazy submodules
-    "regions",
-    "plot",
 ]
+
+# ``regions`` and ``plot`` are optional lazy submodules reachable as attributes (see
+# __getattr__/__dir__); they are deliberately NOT in __all__, so ``from arrangement_2d
+# import *`` does not fail when they are not installed.

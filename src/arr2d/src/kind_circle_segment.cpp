@@ -544,9 +544,24 @@ class CircleSegmentOps final : public KindOpsBase<CircleSegmentTypes> {
       // l2r == is_directed_right() turns CGAL's left->right / right->left choice into the
       // curve's own source -> target order (traits map §6, Approximate_2).
       approx(piece, error, std::back_inserter(pts), piece.is_directed_right());
+      if (pts.empty()) continue;
+      // CGAL's Approximate_2 converts with CGAL::to_double(Epeck::FT) on the lazy INTERVAL, which
+      // is not correctly rounded (the rule this file opens with), so its endpoints disagreed with
+      // point_approx() / Point.approx / Arrangement.vertex_coordinates() for the very same
+      // point — measured on 27 % of random rational-endpoint arcs, which breaks any renderer
+      // that stitches approximate_edges() to vertex_coordinates() by float identity.  Both
+      // endpoints are always emitted (rendering_and_approximation.md gotcha 4), so overwrite
+      // exactly those two with this kind's own correctly-rounded conversion; the interior samples
+      // are pure rendering data and stay as CGAL produced them.
+      const double sx = coord_to_double(piece.source().x());
+      const double sy = coord_to_double(piece.source().y());
+      const double tx = coord_to_double(piece.target().x());
+      const double ty = coord_to_double(piece.target().y());
       for (std::size_t i = 0; i < pts.size(); ++i) {
-        const double x = pts[i].x();
-        const double y = pts[i].y();
+        double x = pts[i].x();
+        double y = pts[i].y();
+        if (i == 0) { x = sx; y = sy; }
+        else if (i + 1 == pts.size()) { x = tx; y = ty; }
         if (i == 0 && out.size() >= 2 && out[out.size() - 2] == x && out[out.size() - 1] == y)
           continue;   // shared junction point already emitted by the previous piece
         out.push_back(x);

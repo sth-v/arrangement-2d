@@ -1030,11 +1030,23 @@ class ConicOps final : public KindOpsBase<ConicTypes> {
     // `is_directed_right` reproduces source -> target order, which is what ops.hpp promises.
     const bool l2r = (cmp_end(x) == CGAL::SMALLER);
     ap(x, error, std::back_inserter(pts), l2r);
-    std::size_t i = (skip_first && !pts.empty()) ? 1 : 0;
+    if (pts.empty()) return;
+    // Approximate_2 is CGAL::to_double(CORE::Expr), i.e. an approximation of an approximation
+    // (see approximate_coordinate above).  Both endpoints are always emitted, so replace exactly
+    // those two with the correctly-rounded conversion used by point_approx() — otherwise every
+    // polyline handed to Python starts and ends on a coordinate that differs from the one
+    // Point.approx / Arrangement.vertex_coordinates() report for the very same point (measured on
+    // 28 % of random rational-endpoint arcs).  Interior samples are rendering data: left alone.
+    const double sx = to_double_correctly_rounded(x.source().x());
+    const double sy = to_double_correctly_rounded(x.source().y());
+    const double tx = to_double_correctly_rounded(x.target().x());
+    const double ty = to_double_correctly_rounded(x.target().y());
+    std::size_t i = skip_first ? 1 : 0;
     out.reserve(out.size() + 2 * (pts.size() - i));
     for (; i < pts.size(); ++i) {
-      out.push_back(pts[i].x());
-      out.push_back(pts[i].y());
+      if (i == 0) { out.push_back(sx); out.push_back(sy); }
+      else if (i + 1 == pts.size()) { out.push_back(tx); out.push_back(ty); }
+      else { out.push_back(pts[i].x()); out.push_back(pts[i].y()); }
     }
   }
 };

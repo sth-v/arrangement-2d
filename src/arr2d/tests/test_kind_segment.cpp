@@ -727,13 +727,12 @@ static void test_arrangement() {
   CHECK(!arr->face_is_unbounded(low.as_face()));
   CHECK(arr->face_is_unbounded(out.as_face()));
 
-  // every one of the six strategies is supported by this kind and agrees with the default
-  // NB on PL_TRIANGULATION: KindPolicy<SegmentTypes> enables it (segment is the only kind with
-  // straight edges and a Kernel), but CGAL's triangulation strategy is known to answer with the
-  // wrong face for faces WITH HOLES (CGAL_TRAPS_CHECKLIST.md, point location).  The queries below
-  // deliberately stay on faces it handles correctly.
-  const int strategies[6] = {PL_NAIVE, PL_SIMPLE, PL_WALK, PL_LANDMARKS, PL_TRAPEZOID,
-                             PL_TRIANGULATION};
+  // every one of the five EXPOSED strategies is supported by this kind and agrees with the default.
+  // NB on PL_TRIANGULATION: it compiles for segments (the only kind with straight edges and a
+  // Kernel), but CGAL 6.1's triangulation strategy answers with the WRONG face for faces WITH
+  // HOLES (CGAL_TRAPS_CHECKLIST.md, point location), so KindPolicy<SegmentTypes> now sets
+  // supports_triangulation = false and the strategy is refused for every kind.
+  const int strategies[5] = {PL_NAIVE, PL_SIMPLE, PL_WALK, PL_LANDMARKS, PL_TRAPEZOID};
   for (int s : strategies) {
     CHECK_M(arr->supports_point_location(s), point_location_name(s));
     // as a temporary strategy object ...
@@ -746,6 +745,11 @@ static void test_arrangement() {
     arr->detach_point_location(s);
     CHECK_M(!arr->has_point_location(s), point_location_name(s));
   }
+  // triangulation is deliberately NOT exposed (see above): every entry point refuses it.
+  CHECK(!arr->supports_point_location(PL_TRIANGULATION));
+  CHECK(throws_error([&] { arr->locate(p_up, PL_TRIANGULATION); }, ErrorCode::Unsupported));
+  CHECK(throws_error([&] { arr->attach_point_location(PL_TRIANGULATION); }, ErrorCode::Unsupported));
+  CHECK(!arr->has_point_location(PL_TRIANGULATION));
   CHECK(!arr->supports_point_location(PL_NUM_STRATEGIES));
   // an unknown strategy id is reported as "not available for this kind" (ArrImpl::require_pl)
   CHECK(throws_error([&] { arr->locate(p_up, 42); }, ErrorCode::Unsupported));
@@ -1097,6 +1101,10 @@ class Ops final : public KindOps {
   int parameter_space_in_y(const Geom&, int) const override { nope(); }
   Geom construct_x_monotone_curve(const Geom&, const Geom&) const override { nope(); }
   double approximate_coordinate(const Geom&, int) const override { nope(); }
+  /// Sweep pre-flight: nothing to guard for this stub (KindOpsBase answers the same way for
+  /// every kind but Bezier).
+  bool needs_sweep_precheck() const override { return false; }
+  void check_sweepable(const std::vector<Geom>&) const override {}
 };
 
 }  // namespace fake_conic

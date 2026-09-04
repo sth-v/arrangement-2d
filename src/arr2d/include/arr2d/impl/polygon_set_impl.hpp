@@ -70,6 +70,7 @@
 #include <utility>
 #include <vector>
 
+#include <CGAL/assertions.h>
 #include <CGAL/Boolean_set_operations_2/Gps_polygon_validation.h>
 #include <CGAL/Boolean_set_operations_2/Gps_traits_adaptor.h>
 #include <CGAL/General_polygon_set_2.h>
@@ -180,7 +181,15 @@ class PolygonSetImpl final : public PolygonSetBase {
   ///
   /// Orientation_2 dereferences its "leftmost" iterator unconditionally, so the two
   /// structural preconditions (a closed chain of >= 2 curves that has a local leftmost
-  /// vertex) are checked here first; anything else returns 0 instead of reading `end`.
+  /// vertex) have to be checked before it runs; and for a CLOSED BUT ZERO-AREA ring (e.g.
+  /// (0,0)->(1,0)->(2,0)->(0,0)) the two curves leaving the leftmost vertex overlap, so
+  /// CGAL's functor trips `CGAL_assertion(res != EQUAL)`
+  /// (Boolean_set_operations_2/Gps_traits_adaptor.h:164/167/179) — it would THROW here (this
+  /// build keeps CGAL checks on) and silently return COUNTERCLOCKWISE with them off.
+  ///
+  /// The leftmost-vertex search below is therefore CGAL's own algorithm, replicated verbatim
+  /// with every comparison CGAL merely *asserts* on turned into `return 0` ("undecidable").
+  /// For a ring CGAL accepts the two agree by construction.
   int orientation(const std::vector<Geom>& boundary) const override {
     const std::size_t n = boundary.size();
     if (n < 2) return 0;
@@ -188,16 +197,49 @@ class PolygonSetImpl final : public PolygonSetBase {
     std::vector<Xcv> ring;
     ring.reserve(n);
     for (const Geom& g : boundary) ring.push_back(xcurve(g));
-    auto cmp = gps().compare_endpoints_xy_2_object();
-    bool has_leftmost = false;
-    for (std::size_t i = 0; i < n && !has_leftmost; ++i)
-      has_leftmost = (cmp(ring[i]) == CGAL::SMALLER) &&
-                     (cmp(ring[(i + n - 1) % n]) == CGAL::LARGER);
-    if (!has_leftmost) return 0;
-    const CGAL::Orientation o = adaptor().orientation_2_object()(ring.begin(), ring.end());
-    if (o == CGAL::COUNTERCLOCKWISE) return 1;
-    if (o == CGAL::CLOCKWISE) return -1;
-    return 0;
+
+    auto cmp_xy = adaptor().compare_xy_2_object();
+    auto cmp_y_at_x_right = adaptor().compare_y_at_x_right_2_object();
+    auto ctr_v = adaptor().construct_vertex_2_object();
+    auto cmp_endpoints = adaptor().compare_endpoints_xy_2_object();
+
+    const std::size_t none = n;            // CGAL's `end`
+    std::size_t from_leftmost = none, into_leftmost = none;
+    std::size_t into = n - 1;
+    try {
+      for (std::size_t from = 0; from < n; ++from) {
+        // Only a vertex that is *entered* from the right and *left* towards the right can be
+        // the leftmost one.
+        if (cmp_endpoints(ring[from]) != CGAL::SMALLER ||
+            cmp_endpoints(ring[into]) != CGAL::LARGER) { into = from; continue; }
+        if (from_leftmost == none) {
+          from_leftmost = from; into_leftmost = into; into = from; continue;
+        }
+        const CGAL::Comparison_result res_xy =
+            cmp_xy(ctr_v(ring[from], 0), ctr_v(ring[from_leftmost], 0));
+        if (res_xy == CGAL::LARGER) { into = from; continue; }
+        if (res_xy == CGAL::SMALLER) {
+          from_leftmost = from; into_leftmost = into; into = from; continue;
+        }
+        // Two candidate vertices coincide: CGAL asserts the three comparisons are decisive.
+        const Pt& v = ctr_v(ring[from_leftmost], 0);
+        const CGAL::Comparison_result from_lm_into = cmp_y_at_x_right(ring[from_leftmost], ring[into], v);
+        const CGAL::Comparison_result into_lm_from = cmp_y_at_x_right(ring[into_leftmost], ring[from], v);
+        const CGAL::Comparison_result into_from = cmp_y_at_x_right(ring[into_leftmost], ring[from_leftmost], v);
+        if (from_lm_into == CGAL::EQUAL || into_lm_from == CGAL::EQUAL ||
+            into_from == CGAL::EQUAL || from_lm_into == into_lm_from)
+          return 0;                        // overlapping curves at the leftmost vertex
+        if (into_from == from_lm_into) { from_leftmost = from; into_leftmost = into; }
+        into = from;
+      }
+      if (from_leftmost == none) return 0;      // no local leftmost vertex
+      const Pt& v = ctr_v(ring[from_leftmost], 0);
+      const CGAL::Comparison_result res = cmp_y_at_x_right(ring[into_leftmost], ring[from_leftmost], v);
+      if (res == CGAL::EQUAL) return 0;         // zero-area / self-overlapping ring
+      return (res == CGAL::SMALLER) ? -1 : 1;   // SMALLER == CLOCKWISE
+    } catch (const CGAL::Failure_exception&) {
+      return 0;                                 // a traits precondition on a degenerate ring
+    }
   }
 
   /// CGAL::is_valid_polygon (no holes, bounded) or CGAL::is_valid_polygon_with_holes.
@@ -234,6 +276,11 @@ class PolygonSetImpl final : public PolygonSetBase {
     // not checked.  Everything goes through the polygon-with-holes validation, exactly like
     // CGAL's own range insert (its elements are Polygon_with_holes_2, so its
     // ValidationPolicy resolves to is_valid_polygon_with_holes).
+    if (needs_sweep_precheck()) {
+      std::vector<Geom> all;
+      for (const PolygonGeom& p : ps) collect_polygon_curves(p, all);
+      reject_unsweepable(all);
+    }
     std::vector<Polygon_with_holes_2> pwhs;
     pwhs.reserve(ps.size());
     for (const PolygonGeom& p : ps) pwhs.push_back(checked_pwh(p, "insert_polygons"));
@@ -244,24 +291,28 @@ class PolygonSetImpl final : public PolygonSetBase {
   void join(const PolygonSetBase& other) override {
     const Self& o = same_kind(other, "join");
     if (&o == this) return;  // A | A == A; CGAL would delete m_arr while reading it
+    reject_unsweepable_with_set(o);
     m_gps.join(o.m_gps);
   }
 
   void intersection(const PolygonSetBase& other) override {
     const Self& o = same_kind(other, "intersection");
     if (&o == this) return;  // A & A == A
+    reject_unsweepable_with_set(o);
     m_gps.intersection(o.m_gps);
   }
 
   void difference(const PolygonSetBase& other) override {
     const Self& o = same_kind(other, "difference");
     if (&o == this) { m_gps.clear(); return; }  // A - A == empty
+    reject_unsweepable_with_set(o);
     m_gps.difference(o.m_gps);
   }
 
   void symmetric_difference(const PolygonSetBase& other) override {
     const Self& o = same_kind(other, "symmetric_difference");
     if (&o == this) { m_gps.clear(); return; }  // A ^ A == empty
+    reject_unsweepable_with_set(o);
     m_gps.symmetric_difference(o.m_gps);
   }
 
@@ -276,21 +327,25 @@ class PolygonSetImpl final : public PolygonSetBase {
   void join_polygon(const PolygonGeom& p) override {
     Self tmp;
     tmp.insert_checked(p, "join_polygon");
+    reject_unsweepable_with_set(tmp);
     m_gps.join(tmp.m_gps);
   }
   void intersection_polygon(const PolygonGeom& p) override {
     Self tmp;
     tmp.insert_checked(p, "intersection_polygon");
+    reject_unsweepable_with_set(tmp);
     m_gps.intersection(tmp.m_gps);
   }
   void difference_polygon(const PolygonGeom& p) override {
     Self tmp;
     tmp.insert_checked(p, "difference_polygon");
+    reject_unsweepable_with_set(tmp);
     m_gps.difference(tmp.m_gps);
   }
   void symmetric_difference_polygon(const PolygonGeom& p) override {
     Self tmp;
     tmp.insert_checked(p, "symmetric_difference_polygon");
+    reject_unsweepable_with_set(tmp);
     m_gps.symmetric_difference(tmp.m_gps);
   }
 
@@ -320,6 +375,7 @@ class PolygonSetImpl final : public PolygonSetBase {
   int oriented_side_of_set(const PolygonSetBase& other) const override {
     const Self& o = same_kind(other, "oriented_side");
     if (&o == this) return is_empty() ? -1 : 1;  // CGAL would still be correct; this is cheaper
+    reject_unsweepable_with_set(o);              // oriented_side(set) is a full sweep
     return static_cast<int>(m_gps.oriented_side(o.m_gps));
   }
 
@@ -336,6 +392,7 @@ class PolygonSetImpl final : public PolygonSetBase {
   bool do_intersect(const PolygonSetBase& other) const override {
     const Self& o = same_kind(other, "do_intersect");
     if (&o == this) return !is_empty();
+    reject_unsweepable_with_set(o);              // do_intersect(set) is a full sweep
     return m_gps.do_intersect(o.m_gps);
   }
 
@@ -512,9 +569,15 @@ class PolygonSetImpl final : public PolygonSetBase {
       if (p.holes[i].empty() || !is_closed_chain(p.holes[i]))
         return "hole " + std::to_string(i) +
                " is not a closed chain of at least two x-monotone curves";
+    if (!p.outer.empty() && orientation(p.outer) == 0)
+      return "the outer boundary encloses no area (a degenerate or self-overlapping ring)";
     if (!p.outer.empty() && orientation(p.outer) != 1)
       return "the outer boundary has clockwise orientation; CGAL requires counterclockwise "
              "outer boundaries (and clockwise holes) — reverse it";
+    for (std::size_t i = 0; i < p.holes.size(); ++i)
+      if (orientation(p.holes[i]) == 0)
+        return "hole " + std::to_string(i) +
+               " encloses no area (a degenerate or self-overlapping ring)";
     for (std::size_t i = 0; i < p.holes.size(); ++i)
       if (orientation(p.holes[i]) != -1)
         return "hole " + std::to_string(i) +
@@ -546,6 +609,7 @@ class PolygonSetImpl final : public PolygonSetBase {
   }
 
   void insert_checked(const PolygonGeom& p, const char* what) {
+    reject_unsweepable_with_polygon(p);
     if (is_plain_polygon(p)) {
       Polygon_2 pgn = checked_polygon(p, what);
       m_gps.insert(pgn);
@@ -553,6 +617,48 @@ class PolygonSetImpl final : public PolygonSetBase {
       Polygon_with_holes_2 pwh = checked_pwh(p, what);
       m_gps.insert(pwh);
     }
+  }
+
+  // ---------------------------------------------------------------- sweep pre-flight
+  //
+  // Same guard as ArrImpl::reject_unsweepable(), for the OTHER sweep in this library: every
+  // Boolean operation runs CGAL's surface sweep over the boundary curves of both operands and
+  // therefore calls Intersect_2 on pairs that no method of ours ever sees.  Measured for the
+  // BEZIER kind: two DISJOINT polygons — one bounded by an arc of a self-intersecting cubic
+  // (the arc itself simple and nowhere near the crossing), the other by a straight curve
+  // through that crossing — make `join()` and `intersection()` SIGSEGV in every run, while
+  // `insert()` (non-intersecting insertion) is fine.  See KindOps::check_sweepable.
+  //
+  // The registry lookup is guarded by kind_available(): a bso_<kind>.cpp TU is designed to be
+  // linkable without its kind_<kind>.cpp, and in such a build no curve of that kind can exist
+  // in the first place (the constructors live in the kind TU).
+  bool needs_sweep_precheck() const {
+    return kind_available(Types::kind) && ops(Types::kind).needs_sweep_precheck();
+  }
+  /// Appends this set's boundary curves (the edges of its internal arrangement).
+  void collect_curves(std::vector<Geom>& out) const {
+    auto& arr = const_cast<Gps&>(m_gps).arrangement();
+    for (auto e = arr.edges_begin(); e != arr.edges_end(); ++e) out.push_back(box_xcurve(e->curve()));
+  }
+  static void collect_polygon_curves(const PolygonGeom& p, std::vector<Geom>& out) {
+    out.insert(out.end(), p.outer.begin(), p.outer.end());
+    for (const std::vector<Geom>& h : p.holes) out.insert(out.end(), h.begin(), h.end());
+  }
+  void reject_unsweepable(std::vector<Geom>& all) const {
+    collect_curves(all);
+    ops(Types::kind).check_sweepable(all);
+  }
+  void reject_unsweepable_with_polygon(const PolygonGeom& p) const {
+    if (!needs_sweep_precheck()) return;
+    std::vector<Geom> all;
+    collect_polygon_curves(p, all);
+    reject_unsweepable(all);
+  }
+  void reject_unsweepable_with_set(const Self& other) const {
+    if (!needs_sweep_precheck()) return;
+    std::vector<Geom> all;
+    other.collect_curves(all);
+    reject_unsweepable(all);
   }
 
   // ---------------------------------------------------------------- conversions

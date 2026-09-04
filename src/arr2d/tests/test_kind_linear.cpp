@@ -1028,10 +1028,10 @@ void test_arrangement() {
   }
 
   // -- point location, every strategy ------------------------------------
-  const int strategies[5] = {PL_NAIVE, PL_SIMPLE, PL_WALK, PL_LANDMARKS, PL_TRAPEZOID};
-  const char* snames[5] = {"naive", "simple", "walk", "landmarks", "trapezoid"};
+  const int strategies[3] = {PL_NAIVE, PL_SIMPLE, PL_WALK};
+  const char* snames[3] = {"naive", "simple", "walk"};
   const Geom inside = P(1, 1);                          // inside the triangle
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 3; ++i) {
     chk(A->supports_point_location(strategies[i]),
         std::string("supports ") + snames[i]);
     const Located l0 = A->locate(inside, strategies[i]);     // temporary strategy object
@@ -1043,6 +1043,57 @@ void test_arrangement() {
     chk(l1.type == 2 && FH{l1.p, l1.id} == tri,
         std::string("locate((1,1), ") + snames[i] + ") == the triangle (attached)");
   }
+  // Landmarks PL is a per-ARRANGEMENT capability for this kind (ArrImpl::landmarks_usable()):
+  // Arr_landmarks_point_location::_deal_with_curve_contained_in_segment
+  // (Arr_landmarks_pl_impl.h:414) reads point() on a vertex at infinity for a query point on an
+  // unbounded edge, and _walk_from_face (:533) runs out of crossable edges on the all-fictitious
+  // outer ccb of the unbounded face.  `A` is made of LINES, so it is refused here...
+  chk(A->number_of_vertices_at_infinity() > 0, "this arrangement has vertices at infinity");
+  chk(!A->supports_point_location(PL_LANDMARKS),
+      "landmarks PL is NOT supported while an unbounded edge is present");
+  chk_error([&] { A->attach_point_location(PL_LANDMARKS); }, ErrorCode::Unsupported,
+            "attach(landmarks) -> Unsupported");
+  chk_error([&] { (void)A->locate(inside, PL_LANDMARKS); }, ErrorCode::Unsupported,
+            "locate(landmarks) -> Unsupported");
+  // ... and offered on an arrangement of this very kind that holds only bounded segments, where
+  // the CGAL bug is structurally unreachable (a CCB never mixes fictitious and concrete
+  // halfedges then).  Verified against the naive strategy.
+  {
+    std::unique_ptr<ArrBase> B = make_arrangement(Kind::Linear);
+    const std::vector<Geom> box = {linear::make_segment(P(0, 0), P(4, 0)),
+                                   linear::make_segment(P(4, 0), P(4, 4)),
+                                   linear::make_segment(P(4, 4), P(0, 4)),
+                                   linear::make_segment(P(0, 4), P(0, 0)),
+                                   linear::make_segment(P(0, 0), P(4, 4))};
+    std::vector<CH> chs;
+    B->insert_curves(box, chs);
+    chk_eq((long long)B->number_of_vertices_at_infinity(), 0,
+           "a linear arrangement of bounded segments has no vertex at infinity");
+    chk(B->supports_point_location(PL_LANDMARKS), "landmarks PL IS supported for it");
+    B->attach_point_location(PL_LANDMARKS);
+    const Geom qs[5] = {P(1, 3), P(2, 0), P(2, 2), P(0, 0), P(100, 100)};
+    for (int i = 0; i < 5; ++i) {
+      const Located lm = B->locate(qs[i], PL_LANDMARKS);
+      const Located nv = B->locate(qs[i], PL_NAIVE);
+      // point location returns an arbitrary twin for an edge: compare the feature TYPE, and the
+      // identity only for a vertex or a face.
+      chk(lm.type == nv.type && (lm.type == 1 || lm.p == nv.p),
+          "landmarks agrees with naive on a bounded linear arrangement");
+    }
+    // inserting a line withdraws the strategy again (the attached object stays, unused)
+    B->insert_curve(linear::make_line(P(0, -2), P(1, -2)));
+    chk(!B->supports_point_location(PL_LANDMARKS), "a line withdraws landmarks again");
+    chk(B->has_point_location(PL_LANDMARKS), "... the attached object is still there");
+    chk_error([&] { (void)B->locate(P(2, -2), PL_LANDMARKS); }, ErrorCode::Unsupported,
+              "locate(landmarks) -> Unsupported once a line is present");
+  }
+  // Trapezoid PL is disabled for this kind: an ATTACHED Arr_trapezoid_ric_point_location asserts
+  // when an edge incident to a vertex at infinity is removed (see test_trapezoid_removal_trap).
+  chk(!A->supports_point_location(PL_TRAPEZOID), "trapezoid PL is NOT supported (unbounded kind)");
+  chk_error([&] { A->attach_point_location(PL_TRAPEZOID); }, ErrorCode::Unsupported,
+            "attach(trapezoid) -> Unsupported");
+  chk_error([&] { (void)A->locate(inside, PL_TRAPEZOID); }, ErrorCode::Unsupported,
+            "locate(trapezoid) -> Unsupported");
   // Triangulation PL is disabled for this kind: it calls point() on vertices at infinity
   // (point_location_and_decomposition.md gotcha 9).
   chk(!A->supports_point_location(PL_TRIANGULATION), "triangulation PL is NOT supported");
@@ -1131,10 +1182,10 @@ void test_arrangement() {
   // -- remove_curve ------------------------------------------------------
   // CGAL 6.1 BUG (characterised in test_trapezoid_removal_trap below): an ATTACHED
   // Arr_trapezoid_ric_point_location asserts (`p_pt != nullptr`, Arr_dcel_base.h:105) when an
-  // edge incident to a vertex at infinity is removed. Detach it first; the other four
-  // strategies stay attached on purpose, to prove they survive the removal.
-  A->detach_point_location(PL_TRAPEZOID);
-  chk(!A->has_point_location(PL_TRAPEZOID), "the trapezoid strategy is detached");
+  // edge incident to a vertex at infinity is removed.  It can no longer be attached at all for
+  // this kind (KindPolicy<LinearTypes>::supports_trapezoid == false); the other four strategies
+  // stay attached on purpose, to prove they survive the removal.
+  chk(!A->has_point_location(PL_TRAPEZOID), "the trapezoid strategy is never attached");
 
   const std::size_t removed = A->remove_curve(c_d4);
   chk_eq((long long)removed, 3, "remove_curve(x+y=4) removes its 3 edges");
@@ -1181,25 +1232,65 @@ void test_overlapping_unbounded_insert() {
     chk(A->is_valid(), "ray overlap: the arrangement stays valid");
   }
 
-  // (b) a LINE overlapping the same line: the overlap runs to -infinity, and CGAL's sweep calls
-  //     Construct_min_vertex_2 on it -> CGAL_precondition(cv.has_left()) fails
-  //     (Arr_linear_traits_2.h:689). With -DNDEBUG this check disappears and CGAL reads
-  //     cv.left() of an unbounded end instead. Nothing in arr2d intercepts it today; see the
-  //     interface change request in the report.
+  // (b) a LINE overlapping the same line: the overlap runs to -infinity, and CGAL's sweep would
+  //     call Construct_min_vertex_2 on it -> CGAL_precondition(cv.has_left()) fails
+  //     (Arr_linear_traits_2.h:689); with -DNDEBUG the check disappears and CGAL reads cv.left()
+  //     of an unbounded end instead.  ArrImpl::reject_unbounded_overlap() detects the overlap
+  //     first and reports Error(Unsupported); the arrangement is left untouched.
   {
     std::unique_ptr<ArrBase> A = make_arrangement(Kind::Linear);
     A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0)));
-    bool threw = false;
     std::string msg;
+    chk_error([&] { A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0))); },
+              ErrorCode::Unsupported, "insert_curve(line overlapping a line) -> Unsupported");
     try {
-      A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0)));   // the same line again
-    } catch (const std::exception& e) {
-      threw = true;
-      msg = e.what();
-    }
-    chk(threw, "inserting a line that overlaps an unbounded edge raises (a CGAL precondition)");
-    chk(msg.find("has_left") != std::string::npos,
-        "and the failing expression is cv.has_left() (got: " + msg + ")");
+      A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0)));
+    } catch (const Error& e) { msg = e.what(); }
+    chk(msg.find("unbounded curve overlapping an existing edge") != std::string::npos,
+        "and the message names the reason (got: " + msg + ")");
+    chk_eq((long long)A->number_of_edges(), 1, "the arrangement is unchanged (still 1 edge)");
+    chk_eq((long long)A->number_of_curves(), 1, "and the history still holds one curve");
+    chk(A->is_valid(), "and it is still valid");
+    // The same guard fires for a ray whose overlap runs to -infinity ...
+    chk_error([&] { A->insert_curve(linear::make_ray(P(2, 0), P(-5, 0))); },
+              ErrorCode::Unsupported, "insert_curve(left-going ray on the line) -> Unsupported");
+    // ... and for insert_non_intersecting_curve / insert_curves on the same input.
+    chk_error([&] { A->insert_non_intersecting_curve(linear::make_line_coefficients(R(0), R(1), R(0))); },
+              ErrorCode::Unsupported, "insert_non_intersecting_curve -> Unsupported");
+    std::vector<Geom> again = {linear::make_line_coefficients(R(0), R(1), R(0))};
+    std::vector<CH> hs;
+    chk_error([&] { A->insert_curves(again, hs); }, ErrorCode::Unsupported,
+              "insert_curves -> Unsupported");
+    chk(A->is_valid(), "the arrangement survived all four refusals");
+  }
+
+  // (b2) the AGGREGATE path is stricter than the incremental one: CGAL's sweep asserts
+  //      `! e->is_fictitious()` (Arrangement_on_surface_2_impl.h:1517) whenever the overlap is
+  //      unbounded at EITHER end, so the RIGHT-going ray of case (a) -- which insert_curve()
+  //      handles -- has to be refused when it goes through insert_curves().
+  {
+    std::unique_ptr<ArrBase> A = make_arrangement(Kind::Linear);
+    A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0)));   // y = 0
+    std::vector<Geom> ray = {linear::make_ray(P(2, 0), P(5, 0))};
+    std::vector<CH> hs;
+    chk_error([&] { A->insert_curves(ray, hs); }, ErrorCode::Unsupported,
+              "insert_curves(right-going ray on the line) -> Unsupported (aggregate is stricter)");
+    // the incremental path still accepts it
+    A->insert_curve(linear::make_ray(P(2, 0), P(5, 0)));
+    chk_eq((long long)A->number_of_edges(), 2, "insert_curve still accepts the same ray");
+    chk(A->is_valid(), "and the arrangement stays valid");
+  }
+
+  // (b3) an unbounded curve overlapping a BOUNDED edge produces a bounded overlap: legal on
+  //      both paths.
+  {
+    std::unique_ptr<ArrBase> A = make_arrangement(Kind::Linear);
+    A->insert_curve(linear::make_segment(P(0, 0), P(5, 0)));
+    std::vector<Geom> ray = {linear::make_ray(P(2, 0), P(5, 0))};
+    std::vector<CH> hs;
+    A->insert_curves(ray, hs);
+    chk_eq((long long)hs.size(), 1, "aggregate insert of a ray over a bounded segment works");
+    chk(A->is_valid(), "and the arrangement is valid");
   }
 
   // (c) the very same pair inserted AGGREGATELY (one sweep) works: the sweep never asks for the
@@ -1234,42 +1325,29 @@ void test_overlapping_unbounded_insert() {
 //     Removing a BOUNDED edge is fine, and every other strategy is fine.
 // ===========================================================================
 void test_trapezoid_removal_trap() {
-  section("trapezoid PL + removal on an unbounded arrangement (CGAL bug)");
+  section("trapezoid PL is refused for the unbounded kind (CGAL bug)");
 
-  // Bounded edges: no problem.
-  {
-    std::unique_ptr<ArrBase> A = make_arrangement(Kind::Linear);
-    A->insert_curve(linear::make_segment(P(0, 0), P(4, 0)));
-    const CH c = A->insert_curve(linear::make_segment(P(4, 0), P(0, 4)));
-    A->insert_curve(linear::make_segment(P(0, 4), P(0, 0)));
-    A->attach_point_location(PL_TRAPEZOID);
-    chk_eq((long long)A->remove_curve(c), 1, "trapezoid attached: removing a BOUNDED edge works");
-    chk(A->is_valid(), "and the arrangement stays valid");
-  }
-
-  // An edge with an end at infinity: CGAL asserts.
+  // The strategy is now rejected at every entry point, which is what keeps the CGAL assertion
+  // out of reach.  (Before KindPolicy<LinearTypes>::supports_trapezoid was set to false, the
+  // sequence below -- attach + remove_curve of a line -- raised `p_pt != nullptr`.)
   {
     std::unique_ptr<ArrBase> A = make_arrangement(Kind::Linear);
     const CH c = A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0)));  // y = 0
     A->insert_curve(linear::make_line_coefficients(R(1), R(0), R(0)));               // x = 0
-    A->attach_point_location(PL_TRAPEZOID);
-    bool threw = false;
-    std::string msg;
-    try {
-      (void)A->remove_curve(c);
-    } catch (const std::exception& e) {
-      threw = true;
-      msg = e.what();
-    }
-    chk(threw, "trapezoid attached: removing an edge that touches infinity raises");
-    chk(msg.find("p_pt != nullptr") != std::string::npos,
-        "and it is the Arr_dcel_base p_pt assertion (got: " + msg + ")");
+    chk(!A->supports_point_location(PL_TRAPEZOID), "supports_point_location(trapezoid) is false");
+    chk_error([&] { A->attach_point_location(PL_TRAPEZOID); }, ErrorCode::Unsupported,
+              "attach(trapezoid) -> Unsupported");
+    chk(!A->has_point_location(PL_TRAPEZOID), "nothing got attached");
+    A->detach_point_location(PL_TRAPEZOID);        // a no-op, must not throw
+    chk_eq((long long)A->remove_curve(c), 2, "and removing the line at infinity now works");
+    chk(A->is_valid(), "and the arrangement stays valid");
   }
 
-  // Every other strategy survives the same removal.
-  const int ok[4] = {PL_NAIVE, PL_SIMPLE, PL_WALK, PL_LANDMARKS};
-  const char* names[4] = {"naive", "simple", "walk", "landmarks"};
-  for (int i = 0; i < 4; ++i) {
+  // Every other strategy survives the same removal.  (Landmarks is not offered for this kind
+  // either -- see the point-location section of test_arrangement.)
+  const int ok[3] = {PL_NAIVE, PL_SIMPLE, PL_WALK};
+  const char* names[3] = {"naive", "simple", "walk"};
+  for (int i = 0; i < 3; ++i) {
     std::unique_ptr<ArrBase> A = make_arrangement(Kind::Linear);
     const CH c = A->insert_curve(linear::make_line_coefficients(R(0), R(1), R(0)));
     A->insert_curve(linear::make_line_coefficients(R(1), R(0), R(0)));

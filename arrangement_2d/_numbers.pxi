@@ -323,8 +323,11 @@ cdef class SqrtExtension:
     def interval(self, int bits=53):
         """Return a certified interval ``(lo, hi)`` of floats containing the exact value.
 
-        :param bits: requested relative precision (ignored for sqrt extensions, which are
-            always evaluated to full double precision).
+        :param bits: precision of the first refinement step (never below 53).  The
+            enclosure is then refined adaptively until its two bounds are the same double
+            or two adjacent doubles, so the default already gives the tightest interval
+            doubles allow -- including for a value that is many orders of magnitude smaller
+            than its own terms, where a fixed precision returned an interval straddling 0.
         :rtype: tuple[float, float]
         """
         cdef pair[double, double] iv = number_interval(self.g, bits)
@@ -333,9 +336,10 @@ cdef class SqrtExtension:
     def refine(self, int bits=53):
         """Refine the approximation to *bits* and return the resulting interval.
 
-        Equivalent to :meth:`interval` for sqrt extensions (they are exact by
-        construction); the method exists so that :class:`SqrtExtension` and
-        :class:`Algebraic` are interchangeable.
+        Identical to :meth:`interval`: a sqrt extension is exact by construction, and the
+        enclosure is refined adaptively anyway, so *bits* only sets the starting precision.
+        The method exists so that :class:`SqrtExtension` and :class:`Algebraic` are
+        interchangeable.
 
         :rtype: tuple[float, float]
         """
@@ -383,8 +387,16 @@ cdef class Algebraic:
 
     These are the coordinates of Bezier and conic intersection points.  They cannot be
     written down as a fraction in general; you get a correctly rounded ``float``
-    (:attr:`approx`), a certified :meth:`interval`, an exact :meth:`sign` and exact
-    comparisons.
+    (:attr:`approx`), a certified :meth:`interval` and an exact :meth:`sign`.
+
+    Comparisons against another :class:`Algebraic` are CORE's own (exact).  Comparisons
+    against a ``Fraction`` / :class:`SqrtExtension` are decided from the certified
+    enclosure instead of ``CORE::Expr::cmp``, which is known to answer EQUAL for a rational
+    that is strictly below an algebraic value (measured with sqrt(2) and a convergent
+    p/q satisfying p^2 - 2q^2 = -1).  The enclosure separates the two whenever they differ;
+    if it still cannot after 2^20 bits, the values are reported EQUAL -- CORE offers no
+    exact rationality test, so an ``Algebraic`` that really is rational can only be
+    recognised that way.
 
     Instances come out of ``point.exact()`` / ``curve.exact()``; the only way to build one
     directly is :meth:`from_rational`.

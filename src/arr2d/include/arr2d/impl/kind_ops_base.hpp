@@ -217,6 +217,11 @@ class KindOpsBase : public KindOps {
   double approximate_coordinate(const Geom& p, int i) const override;
   double approximate_length(const Geom& c, double tolerance) const override;   ///< via approximate()
 
+  /// Sweep pre-flight (KindOps): no CGAL 6.1 sweep bug is known for this kind.  Only the Bezier
+  /// TU overrides these two.
+  bool needs_sweep_precheck() const override { return false; }
+  void check_sweepable(const std::vector<Geom>& curves) const override { (void)curves; }
+
   // ---- kind-specific (pure virtual here; the kind TU implements them) ----
   // Geom make_point(const Rational&, const Rational&) const
   // Geom make_point_3(...) const                       (planar kinds: throw Unsupported)

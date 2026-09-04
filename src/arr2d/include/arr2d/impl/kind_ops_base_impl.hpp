@@ -122,6 +122,7 @@ bool KindOpsBase<Types>::point_equal(const Geom& p, const Geom& q) const {
 template <class Types>
 void KindOpsBase<Types>::make_x_monotone(const Geom& c, std::vector<Geom>& out) const {
   require_any_curve(c, Types::kind, "curve");
+  out.clear();   // ops.hpp contract: every output vector is cleared first
   // An x-monotone curve of a kind whose Curve_2 differs from X_monotone_curve_2 cannot be fed
   // to Make_x_monotone_2 at all; it is already the answer.
   if (c.type == GeomType::XCurve && !c.template holds<Curve_2>()) {
@@ -131,7 +132,7 @@ void KindOpsBase<Types>::make_x_monotone(const Geom& c, std::vector<Geom>& out) 
   std::vector<Make_x_monotone_result> res;
   auto mx = traits().make_x_monotone_2_object();
   mx(curve(c), std::back_inserter(res));
-  out.reserve(out.size() + res.size());
+  out.reserve(res.size());
   for (const auto& item : res) {
     if (const Point_2* p = std::get_if<Point_2>(&item)) out.push_back(box_point(*p));
     else out.push_back(box_xcurve(*std::get_if<X_monotone_curve_2>(&item)));
@@ -288,9 +289,46 @@ bool KindOpsBase<Types>::is_in_x_range(const Geom& xc, const Geom& p) const {
 template <class Types>
 void KindOpsBase<Types>::split(const Geom& xc, const Geom& p, Geom& left, Geom& right) const {
   if constexpr (has_split) {
-    // CGAL precondition: p lies on the curve and is not one of its endpoints. CGAL checks it
-    // (preconditions are enabled in this build); duplicating the test would cost a full
-    // point-on-curve evaluation (very expensive for Bezier/conic).
+    // CGAL precondition: p lies on the curve and is not one of its endpoints.  Six of the seven
+    // traits check it, but the GEODESIC one does NOT: Arr_geodesic_arc_on_sphere_traits_2::
+    // Split_2 (Arr_geodesic_arc_on_sphere_traits_2.h:2258-2266) only rejects a degenerate arc and
+    // the two endpoints, so any point whatsoever is accepted and two arcs that do not lie on the
+    // stored great circle come back (Arrangement.split_edge then corrupts the arrangement:
+    // is_valid() turns False and the next insert dies in Multiset.h:2170).  Check it here for
+    // every kind — one Compare_y_at_x_2 is exactly what the other traits' own preconditions cost.
+    // (BezierOps::split overrides this method with the same test plus its own diagnostics.)
+    bool in_x = false;
+    try {
+      auto in_range = adaptor().is_in_x_range_2_object();
+      in_x = in_range(xcurve(xc), point(p));
+    } catch (...) {
+      // The predicates have preconditions of their own (the sphere's Compare_x_2 needs
+      // `is_no_boundary()`, i.e. no pole and no identification point); a point that cannot even
+      // be tested is certainly not a legal split point.
+      in_x = false;
+    }
+    if (!in_x) invalid("split: the point is not in the x-range of the curve");
+    bool on_curve = false;
+    try {
+      auto cmp = adaptor().compare_y_at_x_2_object();
+      on_curve = (cmp(point(p), xcurve(xc)) == CGAL::EQUAL);
+    } catch (...) {
+      on_curve = false;
+    }
+    if (!on_curve) invalid("split: the point does not lie on the curve");
+    // CGAL's documented precondition: p is in the INTERIOR of the curve.  An end that lies at
+    // infinity (a Linear ray / line) has no vertex to compare with, hence the Is_closed_2 gate.
+    {
+      auto closed = adaptor().is_closed_2_object();
+      auto eq = traits().equal_2_object();
+      auto minv = traits().construct_min_vertex_2_object();
+      auto maxv = traits().construct_max_vertex_2_object();
+      const X_monotone_curve_2& c = xcurve(xc);
+      const Point_2& pt = point(p);
+      if ((closed(c, CGAL::ARR_MIN_END) && eq(pt, minv(c))) ||
+          (closed(c, CGAL::ARR_MAX_END) && eq(pt, maxv(c))))
+        invalid("split: the point is an endpoint of the curve, not an interior point");
+    }
     X_monotone_curve_2 c1, c2;
     auto sp = traits().split_2_object();
     sp(xcurve(xc), point(p), c1, c2);
@@ -308,7 +346,8 @@ void KindOpsBase<Types>::intersect(const Geom& xc1, const Geom& xc2, std::vector
   std::vector<Intersection_result> res;
   auto isect = traits().intersect_2_object();
   isect(xcurve(xc1), xcurve(xc2), std::back_inserter(res));
-  out.reserve(out.size() + res.size());
+  out.clear();   // ops.hpp contract: every output vector is cleared first
+  out.reserve(res.size());
   for (const auto& item : res) {
     IntersectionResult r;
     if (const Intersection_point* ip = std::get_if<Intersection_point>(&item)) {
@@ -424,20 +463,15 @@ Geom KindOpsBase<Types>::construct_x_monotone_curve(const Geom& p, const Geom& q
 template <class Types>
 double KindOpsBase<Types>::approximate_coordinate(const Geom& p, int i) const {
   if (i < 0 || i >= dimension()) invalid("coordinate index out of range");
-  if constexpr (has_approximate_coord) {
-    // Approximate_2's coordinate overload takes `int` in every concrete traits
-    // (traits_adapters_and_misc.md gotcha 9). The geodesic traits accepts i == 2 (dz) even
-    // though its doc comment mentions only 0 and 1.
-    auto approx = traits().approximate_2_object();
-    return static_cast<double>(approx(point(p), i));
-  } else {
-    // Bezier has no Approximate_2 (traits_bezier.md gotcha 8) -> the kind's own
-    // point_approx(), which goes through _Bezier_point_2::approximate() and is always safe
-    // even for non-exact points.
-    double xyz[3] = {0.0, 0.0, 0.0};
-    point_approx(p, xyz);
-    return xyz[i];
-  }
+  // ops.hpp contract: approximate_coordinate agrees with point_approx.  CGAL's own
+  // Approximate_2 is deliberately NOT used: for every Epeck-based traits it is
+  // `CGAL::to_double(Lazy_exact_nt)`, which is not correctly rounded (measured: 1/3 ->
+  // 0.33333333333333337 instead of 0.33333333333333331; number_types_and_errors.md gotcha 2,
+  // CGAL_TRAPS_CHECKLIST "Numbers / coordinates"), and for the sphere it returns the raw
+  // unnormalised component.  point_approx() is the kind's correctly-rounded conversion.
+  double xyz[3] = {0.0, 0.0, 0.0};
+  point_approx(p, xyz);
+  return xyz[i];
 }
 
 template <class Types>

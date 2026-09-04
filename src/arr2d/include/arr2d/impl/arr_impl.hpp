@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -47,6 +48,7 @@
 // this header (never Arrangement_2/Arrangement_on_surface_2_global.h alone).
 #include <CGAL/Arrangement_on_surface_2.h>
 #include <CGAL/Arrangement_on_surface_with_history_2.h>
+#include <CGAL/Arrangement_2/Arr_with_history_accessor.h>
 #include <CGAL/Arr_overlay_2.h>
 #include <CGAL/Arr_point_location_result.h>
 #include <CGAL/Arr_batched_point_location.h>
@@ -96,6 +98,17 @@ struct KindPolicy {
   /// Arr_landmarks_point_location: needs traits Approximate_2 + Construct_x_monotone_curve_2.
   static constexpr bool supports_landmarks = true;
   /// Arr_trapezoid_ric_point_location: planar topologies only.
+  ///
+  /// CGAL 6.1 CAVEAT (handled by ArrImpl::TrapGuard, not by this flag): while such an object is
+  /// ATTACHED, any edge MERGE (Arrangement.merge_edge, or remove_vertex on a degree-2 vertex)
+  /// makes its observer raise `ptr()->v == ptr()->cw_he->source()`
+  /// (Arr_point_location/Td_active_vertex.h:168) from inside Arrangement_on_surface_2::merge_edge
+  /// — measured for segment, polyline, circle_segment, conic and bezier.  Worse, the exception
+  /// escapes between Curve_halfedges_observer::before_merge_edge (which already unregistered both
+  /// edges) and after_merge_edge, so the CURVE HISTORY is left asymmetric and a later
+  /// remove_curve() + copy()/assign()/overlay() dereferences a freed Curve_halfedges node.
+  /// ArrImpl therefore detaches and rebuilds the structure around every merging operation, and
+  /// repairs the history if any exception escapes a with-history modification.
   static constexpr bool supports_trapezoid = !Types::is_sphere;
   /// Arr_triangulation_point_location: needs Geometry_traits_2::Kernel, bounded, straight edges.
   static constexpr bool supports_triangulation = false;
@@ -136,6 +149,21 @@ struct KindPolicy<LinearTypes> {
   static constexpr bool supports_naive = true;
   static constexpr bool supports_simple = true;
   static constexpr bool supports_walk = true;
+  /// Landmarks is offered, but ONLY while the arrangement holds no unbounded edge — see
+  /// ArrImpl::landmarks_usable(), which is what supports_point_location(PL_LANDMARKS) reports
+  /// for this kind.  CGAL 6.1 breaks in two places as soon as a ray or a line is present:
+  /// `_deal_with_curve_contained_in_segment` (Arr_landmarks_pl_impl.h:414) compares
+  /// `he->source()->point()` with `he->target()->point()` WITHOUT the is_at_open_boundary()
+  /// guard its sibling code at :309/:329 uses -> `CGAL_assertion(p_pt != nullptr)`
+  /// (Arr_dcel_base.h:105), plain UB without CGAL_DEBUG; and `_walk_from_face` runs out of
+  /// crossable edges on the all-fictitious outer CCB of the unbounded face ->
+  /// `CGAL_assertion(new_face != face)` (Arr_landmarks_pl_impl.h:533).  Both were measured.
+  /// With no unbounded edge the bug is structurally unreachable: `_intersection_with_ccb` skips
+  /// fictitious halfedges, and the only CCBs that MIX fictitious and concrete halfedges are the
+  /// ones an unbounded edge creates.  Verified with 4320 randomized queries (40 random
+  /// bounded-only arrangements, every vertex, every collinear extension of every edge, the PL
+  /// attached to the arrangement while empty and grown incrementally): zero mismatches against
+  /// Arr_naive_point_location and zero exceptions.
   static constexpr bool supports_landmarks = true;
   static constexpr bool supports_trapezoid = false;  ///< CGAL 6.1 bug: an attached Arr_trapezoid_ric_point_location crashes in before_remove_edge when the edge touches a vertex at infinity (Td_inactive_vertex ctor); see STAGE2_NOTES (kind_linear)
   static constexpr bool supports_triangulation = false;
@@ -222,7 +250,16 @@ struct KindPolicy<SphereTypes> {
   static constexpr bool supports_naive = true;
   static constexpr bool supports_simple = false;
   static constexpr bool supports_walk = false;
-  static constexpr bool supports_landmarks = true;
+  /// COMPILES, but is unusable: the landmark walk connects the nearest landmark to the query
+  /// point with Construct_x_monotone_curve_2(np, p), whose CGAL 6.1 precondition
+  /// `! equal_3(opposite(source), target)` (Arr_geodesic_arc_on_sphere_traits_2.h:611) forbids
+  /// an ANTIPODAL pair — and the landmark set is chosen by CGAL, so nothing the caller does can
+  /// avoid it.  Measured on the two-octant-triangle arrangement: locating the north pole
+  /// (0,0,1) raises that precondition while every other strategy answers correctly; without
+  /// CGAL_DEBUG the same call builds a garbage arc instead.  CGAL_TRAPS_CHECKLIST "Sphere kind"
+  /// ("only Arr_naive_point_location and batched CGAL::locate are safe") is the rule; this flag
+  /// used to contradict it.
+  static constexpr bool supports_landmarks = false;
   static constexpr bool supports_trapezoid = false;
   static constexpr bool supports_triangulation = false;
   static constexpr bool supports_ray_shooting_simple = false;
@@ -338,6 +375,12 @@ class ArrImpl final : public ArrBase {
   bool is_empty() const override { return m_arr.is_empty(); }
 
   bool is_valid() const override {
+    sync();
+    // CGAL's own is_valid() knows nothing about the CURVE HISTORY, so an exception that escaped
+    // a with-history modification (leaving `Curve_halfedges::m_halfedges` and the edges'
+    // `curve().data()` sets disagreeing) went unnoticed and only crashed later, inside
+    // copy()/assign()/overlay().  Report it here instead — see history_is_consistent().
+    if (!history_is_consistent()) return false;
     // The free CGAL::is_valid() adds the sweep + hole-placement checks on top of the member one,
     // but it vertical-ray-shoots with the topology's default strategy, which the sphere lacks.
     if constexpr (Policy::supports_global_is_valid) {
@@ -353,6 +396,7 @@ class ArrImpl final : public ArrBase {
   }
 
   void clear() override {
+    reject_reentrant("clear");
     m_arr.clear();   // observer: after_clear -> live sets emptied
     sync();
   }
@@ -371,9 +415,11 @@ class ArrImpl final : public ArrBase {
   }
 
   void assign(const ArrBase& other) override {
+    reject_reentrant("assign");
     const ArrImpl* o = as_impl(other);
     if (o == this) return;
     m_arr.assign(o->m_arr);
+    renumber();   // the ids copied from `other` are meaningless (and may collide) here
     rescan();
   }
 
@@ -458,7 +504,11 @@ class ArrImpl final : public ArrBase {
       throw_error(ErrorCode::Unsupported, "vertex lies at an open boundary and has no point");
     return box_point(h->point());
   }
-  std::size_t vertex_degree(VH v) const override { return check_v(v)->degree(); }
+  std::size_t vertex_degree(VH v) const override {
+    VHandle h = check_v(v);
+    reject_dead_vertex_ring(v, h, "degree");
+    return h->degree();   // null-safe (Arrangement_on_surface_2.h:595)
+  }
   bool vertex_is_isolated(VH v) const override { return check_v(v)->is_isolated(); }
   FH vertex_face(VH v) const override {
     VHandle h = check_v(v);
@@ -469,7 +519,14 @@ class ArrImpl final : public ArrBase {
   void vertex_incident_halfedges(VH v, std::vector<HH>& out) const override {
     VHandle h = check_v(v);
     out.clear();
-    if (h->is_isolated()) return;   // CGAL precondition of incident_halfedges()
+    reject_dead_vertex_ring(v, h, "incident_halfedges");
+    // CGAL precondition of incident_halfedges(): the vertex must have at least one incident
+    // halfedge.  `is_isolated()` alone is NOT enough — a vertex that CGAL has just created (and
+    // that an observer callback sees in after_create_vertex / before_create_edge /
+    // before_split_edge / after_create_boundary_vertex) is NOT isolated yet and still has a NULL
+    // halfedge pointer, and Vertex::incident_halfedges() has no null check while its sibling
+    // Vertex::degree() has one.  Circulating it SEGFAULTs, so use degree() as the gate.
+    if (h->is_isolated() || h->degree() == 0) return;
     auto circ = h->incident_halfedges();
     auto first = circ;
     do {
@@ -489,7 +546,16 @@ class ArrImpl final : public ArrBase {
   HH he_twin(HH h) const override { return track_h(check_h(h)->twin()); }
   HH he_next(HH h) const override { return track_h(check_h(h)->next()); }
   HH he_prev(HH h) const override { return track_h(check_h(h)->prev()); }
-  FH he_face(HH h) const override { return track_f(check_h(h)->face()); }
+  FH he_face(HH h) const override {
+    // Inside before_split_face CGAL has not re-linked the incident face of the halfedge that is
+    // about to bound the new face: e->face() and e->twin()->face() are dangling and dereferencing
+    // them SEGFAULTs (CGAL_TRAPS_CHECKLIST, "Observer traces").
+    if (h.p != nullptr && (h.p == m_no_face_he[0] || h.p == m_no_face_he[1]))
+      throw_error(ErrorCode::Unsupported,
+                  "halfedge->face() is not available inside before_split_face: CGAL has not yet "
+                  "re-linked the incident face of the new edge");
+    return track_f(check_h(h)->face());
+  }
 
   Geom he_curve(HH h) const override {
     HHandle e = check_h(h);
@@ -616,71 +682,126 @@ class ArrImpl final : public ArrBase {
   //   * split_edge(h, cv1, cv2): cv1/cv2 must be the two halves of h's curve sharing the split
   //     point.  merge_edge(h1, h2, cv): h1 and h2 must share a degree-2 vertex not on an open
   //     boundary, and cv must be their union.
-  //   * remove_isolated_vertex(v): v must be isolated (checked here as well).
+  //   * remove_isolated_vertex(v): v must be isolated (checked HERE, not only by CGAL, so that
+  //     the check survives an assertions-off build).
+  //
+  // insert_at_vertices() additionally replicates CGAL's *containment* preconditions BEFORE the
+  // call: CGAL frees v1's isolated-vertex record and only afterwards asserts that the two
+  // vertices lie in the same face (Arrangement_on_surface_2_impl.h:1026-1050/1081), so letting
+  // that assertion fire leaves the DCEL with a dangling DIso_vertex* — see
+  // reject_bad_insert_at_vertices().
   // None of them record anything in the curve history (the curve is not an input curve); the two
   // exceptions are split_edge/merge_edge/modify_edge, which carry the ORIGINAL edge's
   // originating-curve set over to the new curve so that the history stays consistent.
   VH insert_point_in_face_interior(const Geom& p, FH f) override {
+    reject_reentrant("insert_point_in_face_interior");
     sync();
+    RepairOnThrow repair(this);
     FHandle fh = check_f(f);
     return track_v(m_arr.insert_in_face_interior(point_in(p), fh));
   }
   HH insert_in_face_interior(const Geom& xc, FH f) override {
+    reject_reentrant("insert_in_face_interior");
     sync();
+    reject_unsweepable(xc);
+    RepairOnThrow repair(this);
     FHandle fh = check_f(f);
     // No history: the curve is not an input curve, so its data list stays empty.
     return track_h(m_arr.insert_in_face_interior(DXcv(xcurve_in(xc)), fh));
   }
   HH insert_from_left_vertex(const Geom& xc, VH v) override {
+    reject_reentrant("insert_from_left_vertex");
     sync();
+    reject_unsweepable(xc);
+    RepairOnThrow repair(this);
     VHandle vh = check_v(v);
     return track_h(m_arr.insert_from_left_vertex(DXcv(xcurve_in(xc)), vh));
   }
   HH insert_from_right_vertex(const Geom& xc, VH v) override {
+    reject_reentrant("insert_from_right_vertex");
     sync();
+    reject_unsweepable(xc);
+    RepairOnThrow repair(this);
     VHandle vh = check_v(v);
     return track_h(m_arr.insert_from_right_vertex(DXcv(xcurve_in(xc)), vh));
   }
   HH insert_at_vertices(const Geom& xc, VH v1, VH v2) override {
+    reject_reentrant("insert_at_vertices");
     sync();
+    reject_unsweepable(xc);
+    RepairOnThrow repair(this);
     VHandle a = check_v(v1), b = check_v(v2);
+    reject_bad_insert_at_vertices(a, b);
     return track_h(m_arr.insert_at_vertices(DXcv(xcurve_in(xc)), a, b));
   }
   VH modify_vertex(VH v, const Geom& p) override {
+    reject_reentrant("modify_vertex");
     sync();
+    RepairOnThrow repair(this);
     VHandle vh = check_v(v);
     return track_v(m_arr.modify_vertex(vh, point_in(p)));
   }
   FH remove_isolated_vertex(VH v) override {
+    reject_reentrant("remove_isolated_vertex");
     sync();
+    RepairOnThrow repair(this);
     VHandle vh = check_v(v);
+    // The sphere's boundary rule is checked FIRST: it is the more specific restriction and it is
+    // what the documented contract of this method names for a pole / identification vertex.
+    reject_boundary_vertex_removal(vh, "remove_isolated_vertex");
+    // CGAL only has a *precondition* for the isolation, which disappears under ARR2D_NDEBUG=1 and
+    // then makes CGAL read the Arr_vertex halfedge/isolated-vertex union through the wrong member
+    // and free a halfedge record as if it were an isolated-vertex record.  Check it ourselves.
+    if (!vh->is_isolated())
+      throw_error(ErrorCode::InvalidArgument,
+                  "remove_isolated_vertex() requires an isolated vertex (use remove_vertex())");
     return track_f(m_arr.remove_isolated_vertex(vh));
   }
   HH modify_edge(HH h, const Geom& xc) override {
+    reject_reentrant("modify_edge");
     sync();
+    RepairOnThrow repair(this);
     HHandle e = check_h(h);
     if (e->is_fictitious()) throw_error(ErrorCode::InvalidArgument, "cannot modify a fictitious edge");
+    // `xc` must be geometrically EQUAL to e->curve(), so it carries the same supporting curve.
+    const std::uint64_t support = ops().supporting_curve_id(box_xcurve(e->curve()));
+    reject_unsweepable_replacement(&xc, 1, &support, 1);
     // Keep the originating-curve set of the edge so that the history stays consistent.
     DXcv cv(xcurve_in(xc), e->curve().data());
     return track_h(m_arr.modify_edge(e, cv));
   }
   HH split_edge(HH h, const Geom& xc1, const Geom& xc2) override {
+    reject_reentrant("split_edge");
     sync();
+    RepairOnThrow repair(this);
     HHandle e = check_h(h);
     if (e->is_fictitious()) throw_error(ErrorCode::InvalidArgument, "cannot split a fictitious edge");
     // Arrangement_on_surface_2::split_edge is name-hidden by the with-history 2-argument
     // split_edge (arrangement_with_history.md gotcha 3) — qualify it.
     // Both halves inherit the edge's originating curves (they are parts of the same curves), so
     // the history stays consistent, exactly like the with-history split_edge_at_point().
+    // `xc1`/`xc2` are the two halves of e->curve(), so they carry its supporting curve and
+    // cannot introduce a new dangerous pair; verified in O(1), full pre-flight otherwise.
+    const std::uint64_t support = ops().supporting_curve_id(box_xcurve(e->curve()));
+    const Geom halves[2] = {xc1, xc2};
+    reject_unsweepable_replacement(halves, 2, &support, 1);
     DXcv c1(xcurve_in(xc1), e->curve().data());
     DXcv c2(xcurve_in(xc2), e->curve().data());
     return track_h(m_arr.Base_arr::split_edge(e, c1, c2));
   }
   HH merge_edge(HH h1, HH h2, const Geom& xc) override {
+    reject_reentrant("merge_edge");
     sync();
+    RepairOnThrow repair(this);
+    TrapGuard no_trap(this);   // CGAL 6.1: an attached trapezoid RIC PL breaks on any merge
     HHandle a = check_h(h1), b = check_h(h2);
     if (a->is_fictitious() || b->is_fictitious())
       throw_error(ErrorCode::InvalidArgument, "cannot merge fictitious edges");
+    // `xc` is the union of the two edge curves, so it carries the supporting curve of one of
+    // them; verified in O(1), full pre-flight otherwise.
+    const std::uint64_t support[2] = {ops().supporting_curve_id(box_xcurve(a->curve())),
+                                      ops().supporting_curve_id(box_xcurve(b->curve()))};
+    reject_unsweepable_replacement(&xc, 1, support, 2);
     DXcv cv(xcurve_in(xc), a->curve().data());
     HHandle m = m_arr.Base_arr::merge_edge(a, b, cv);
     // CGAL returns a default-constructed (unusable) handle when the two edges share no vertex and
@@ -690,7 +811,9 @@ class ArrImpl final : public ArrBase {
     return track_h(m);
   }
   FH remove_edge(HH h, bool remove_source, bool remove_target) override {
+    reject_reentrant("remove_edge");
     sync();
+    RepairOnThrow repair(this);
     HHandle e = check_h(h);
     if (e->is_fictitious()) throw_error(ErrorCode::InvalidArgument, "cannot remove a fictitious edge");
     return track_f(m_arr.remove_edge(e, remove_source, remove_target));
@@ -698,7 +821,12 @@ class ArrImpl final : public ArrBase {
 
   // ---- with-history operations & global insertion functions --------------
   CH insert_curve(const Geom& c) override {
+    reject_reentrant("insert");
     sync();
+    reject_unbounded_overlap(c, /*aggregate=*/false);
+    reject_unsweepable(c);
+    reject_identification_curve(&c, 1);
+    RepairOnThrow repair(this);
     Geom store;
     const Curve_2& cv = curve_in(c, store);
     Curve_handle ch = CGAL::insert(m_arr, cv);
@@ -707,9 +835,14 @@ class ArrImpl final : public ArrBase {
   }
 
   void insert_curves(const std::vector<Geom>& cs, std::vector<CH>& out) override {
+    reject_reentrant("insert");
     sync();
     out.clear();
     if (cs.empty()) return;
+    for (const Geom& g : cs) reject_unbounded_overlap(g, /*aggregate=*/true);
+    reject_unsweepable(cs.data(), cs.size());
+    reject_identification_curve(cs.data(), cs.size());
+    RepairOnThrow repair(this);
     std::vector<Geom> store(cs.size());
     std::vector<Curve_2> curves;
     curves.reserve(cs.size());
@@ -727,7 +860,12 @@ class ArrImpl final : public ArrBase {
   }
 
   HH insert_non_intersecting_curve(const Geom& xc) override {
+    reject_reentrant("insert_non_intersecting_curve");
     sync();
+    reject_unbounded_overlap(xc, /*aggregate=*/false);
+    reject_unsweepable(xc);
+    reject_identification_curve(&xc, 1);
+    RepairOnThrow repair(this);
     HHandle he = CGAL::insert_non_intersecting_curve(m_arr, DXcv(xcurve_in(xc)));
     if (he == HHandle())   // precondition violated with assertions compiled out
       throw_error(ErrorCode::InvalidArgument,
@@ -737,8 +875,12 @@ class ArrImpl final : public ArrBase {
   }
 
   void insert_non_intersecting_curves(const std::vector<Geom>& xcs) override {
+    reject_reentrant("insert_non_intersecting_curves");
     sync();
     if (xcs.empty()) return;
+    reject_unsweepable(xcs.data(), xcs.size());
+    reject_identification_curve(xcs.data(), xcs.size());
+    RepairOnThrow repair(this);
     std::vector<DXcv> curves;
     curves.reserve(xcs.size());
     for (const Geom& g : xcs) curves.push_back(DXcv(xcurve_in(g)));
@@ -747,22 +889,30 @@ class ArrImpl final : public ArrBase {
   }
 
   VH insert_point(const Geom& p) override {
+    reject_reentrant("insert_point");
     sync();
+    RepairOnThrow repair(this);
     VHandle v = CGAL::insert_point(m_arr, point_in(p));
     sync();
     return track_v(v);
   }
 
   bool remove_vertex(VH v) override {
+    reject_reentrant("remove_vertex");
     sync();
+    RepairOnThrow repair(this);
+    TrapGuard no_trap(this);   // removing a degree-2 vertex MERGES its two edges
     VHandle vh = check_v(v);
+    reject_boundary_vertex_removal(vh, "remove_vertex");
     bool removed = CGAL::remove_vertex(m_arr, vh);
     sync();
     return removed;
   }
 
   std::size_t remove_curve(CH c) override {
+    reject_reentrant("remove_curve");
     sync();
+    RepairOnThrow repair(this);
     Curve_handle ch = check_c(c);
     std::size_t n = CGAL::remove_curve(m_arr, ch);
     m_curve_ids.erase(c.p);
@@ -771,14 +921,42 @@ class ArrImpl final : public ArrBase {
   }
 
   HH split_edge_at_point(HH h, const Geom& p) override {
+    reject_reentrant("split_edge");
     sync();
+    RepairOnThrow repair(this);
     HHandle e = check_h(h);
     if (e->is_fictitious()) throw_error(ErrorCode::InvalidArgument, "cannot split a fictitious edge");
+    // CGAL's with-history split_edge(e, p) has NO precondition that `p` lies on e's curve, and
+    // neither has the geodesic Split_2 it ends up calling (Arr_geodesic_arc_on_sphere_traits_2.h:
+    // 2258-2266 only rejects a degenerate arc and the two endpoints).  A sphere edge would then
+    // be split into two arcs that do not lie on the stored great circle and the arrangement
+    // becomes invalid, so verify containment ourselves for every kind (the other six traits do
+    // have the precondition, and checking it twice only costs one Compare_y_at_x_2).
+    const Geom cv = box_xcurve(e->curve());
+    bool interior = false;
+    try {
+      const KindOps& o = ops();
+      interior = o.is_in_x_range(cv, p) && o.compare_y_at_x(p, cv) == 0;
+      if (interior && o.xcurve_has_source(cv) && o.point_equal(p, o.xcurve_source(cv)))
+        interior = false;
+      if (interior && o.xcurve_has_target(cv) && o.point_equal(p, o.xcurve_target(cv)))
+        interior = false;
+    } catch (...) {
+      // The predicates themselves have preconditions (the sphere's Compare_x_2 needs
+      // `is_no_boundary()`); a point we cannot even test is certainly not a legal split point.
+      interior = false;
+    }
+    if (!interior)
+      throw_error(ErrorCode::InvalidArgument,
+                  "split_edge: the point does not lie in the interior of the edge's curve");
     return track_h(m_arr.split_edge(e, point_in(p)));   // with-history overload
   }
 
   HH merge_edge_history(HH h1, HH h2) override {
+    reject_reentrant("merge_edge");
     sync();
+    RepairOnThrow repair(this);
+    TrapGuard no_trap(this);   // CGAL 6.1: an attached trapezoid RIC PL breaks on any merge
     HHandle a = check_h(h1), b = check_h(h2);
     if (a->is_fictitious() || b->is_fictitious())
       throw_error(ErrorCode::InvalidArgument, "cannot merge fictitious edges");
@@ -805,10 +983,17 @@ class ArrImpl final : public ArrBase {
       out.push_back(track_h(*it));
   }
   std::size_t number_of_originating_curves(HH h) const override {
-    return m_arr.number_of_originating_curves(check_h(h));
+    HHandle e = check_h(h);
+    // A fictitious halfedge has a null curve pointer; Arrangement_with_history_2 dereferences it
+    // (CGAL/Arr_dcel_base.h:192, Halfedge::curve()) -> assertion with CGAL_DEBUG, UB without it.
+    if (e->is_fictitious())
+      throw_error(ErrorCode::Unsupported, "fictitious halfedges carry no originating curves");
+    return m_arr.number_of_originating_curves(e);
   }
   void originating_curves(HH h, std::vector<CH>& out) const override {
     HHandle e = check_h(h);
+    if (e->is_fictitious())
+      throw_error(ErrorCode::Unsupported, "fictitious halfedges carry no originating curves");
     out.clear();
     for (auto it = m_arr.originating_curves_begin(e); it != m_arr.originating_curves_end(e); ++it) {
       Curve_handle ch = it;   // Originating_curve_iterator -> Curve_iterator
@@ -823,7 +1008,7 @@ class ArrImpl final : public ArrBase {
       case PL_NAIVE: return Policy::supports_naive;
       case PL_SIMPLE: return Policy::supports_simple;
       case PL_WALK: return Policy::supports_walk;
-      case PL_LANDMARKS: return Policy::supports_landmarks;
+      case PL_LANDMARKS: return Policy::supports_landmarks && landmarks_usable();
       case PL_TRAPEZOID: return Policy::supports_trapezoid;
       case PL_TRIANGULATION: return Policy::supports_triangulation;
       default: return false;
@@ -831,6 +1016,7 @@ class ArrImpl final : public ArrBase {
   }
 
   void attach_point_location(int strategy) override {
+    reject_reentrant("attach_point_location");
     sync();
     if (strategy == PL_DEFAULT)
       throw_error(ErrorCode::InvalidArgument, "cannot attach the 'default' point-location strategy");
@@ -869,6 +1055,7 @@ class ArrImpl final : public ArrBase {
   }
 
   void detach_point_location(int strategy) override {
+    reject_reentrant("detach_point_location");
     switch (strategy) {
       case PL_NAIVE: m_pl_naive.reset(); return;
       case PL_SIMPLE: if constexpr (Policy::supports_simple) m_pl_simple.reset(); return;
@@ -898,7 +1085,10 @@ class ArrImpl final : public ArrBase {
     if (strategy == PL_DEFAULT) {
       if constexpr (Policy::supports_trapezoid) { if (m_pl_trap) return from_pl(m_pl_trap->locate(p)); }
       if constexpr (Policy::supports_landmarks) {
-        if (m_pl_landmarks) return from_pl(m_pl_landmarks->locate(p));
+        // An attached landmarks object stays attached when an unbounded curve is inserted (the
+        // insertion itself is safe); only the QUERY is not, so the default strategy falls back
+        // to the walk instead of using it.  See landmarks_usable().
+        if (m_pl_landmarks && landmarks_usable()) return from_pl(m_pl_landmarks->locate(p));
       }
       Default_pl pl(m_arr);
       return from_pl(pl.locate(p));
@@ -954,20 +1144,39 @@ class ArrImpl final : public ArrBase {
   Located ray_shoot_down(const Geom& p, int strategy) const override { return ray_shoot(p, strategy, false); }
 
   /// CGAL precondition (sphere kind): the batched sweep compares points with the traits'
-  /// Compare_x_2, which requires `p.is_no_boundary()` — a spherical arrangement with a vertex on
-  /// a pole or on the identification curve makes CGAL raise a precondition failure (which
-  /// propagates as CGAL::Precondition_exception).  Planar kinds are unrestricted.
+  /// Compare_x_2, which requires `p.is_no_boundary()`.  Worse, a query point at the NORTH POLE
+  /// makes it dereference a null halfedge (EXC_BAD_ACCESS in
+  /// Arr_batched_point_location_traits_2.h:114; STAGE2_NOTES kind_sphere).  Such query points are
+  /// therefore answered ONE BY ONE with the naive strategy, which is safe everywhere, and only
+  /// the interior ones go through the sweep.  Planar kinds are unrestricted.
   void batched_locate(const std::vector<Geom>& pts, std::vector<Located>& out) const override {
     sync();
     out.assign(pts.size(), Located::none());
     if (pts.empty()) return;
 
+    // Indices of the queries that are handed to the batched sweep (all of them, except the
+    // sphere's pole / identification-curve points).
+    std::vector<std::size_t> swept;
+    swept.reserve(pts.size());
+    if constexpr (Types::is_sphere) {
+      Naive_pl pl(m_arr);
+      for (std::size_t i = 0; i < pts.size(); ++i) {
+        const Point_2& p = point_in(pts[i]);
+        if (p.is_no_boundary()) swept.push_back(i);
+        else out[i] = from_pl(pl.locate(p));
+      }
+      if (swept.empty()) return;
+    } else {
+      swept.resize(pts.size());
+      std::iota(swept.begin(), swept.end(), std::size_t(0));
+    }
+
     std::vector<Point_2> ps;
-    ps.reserve(pts.size());
-    for (const Geom& g : pts) ps.push_back(point_in(g));
+    ps.reserve(swept.size());
+    for (std::size_t i : swept) ps.push_back(point_in(pts[i]));
 
     std::vector<std::pair<Point_2, PlResult>> res;
-    res.reserve(pts.size());
+    res.reserve(ps.size());
     CGAL::locate(m_arr, ps.begin(), ps.end(), std::back_inserter(res));
 
     // CGAL::locate emits its results in increasing xy-lexicographic order of the query points
@@ -976,9 +1185,8 @@ class ArrImpl final : public ArrBase {
     // query points into a single event, so there is one result per *distinct* point, not per
     // query — matching by value (not by position) is required.  A query point for which CGAL
     // emitted nothing keeps Located::none().
-    std::vector<std::size_t> order(pts.size());
-    std::iota(order.begin(), order.end(), std::size_t(0));
     const KindOps& o = ops();
+    std::vector<std::size_t> order = swept;
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
       return o.point_compare_xy(pts[a], pts[b]) < 0;
     });
@@ -993,6 +1201,7 @@ class ArrImpl final : public ArrBase {
 
   void zone(const Geom& c, std::vector<Located>& out) override {
     sync();
+    reject_unsweepable(c);
     out.clear();
     std::vector<Geom> pieces;
     split_into_xcurves(c, pieces);
@@ -1003,7 +1212,11 @@ class ArrImpl final : public ArrBase {
         continue;
       }
       std::list<ZoneElem> elems;
-      CGAL::zone(m_arr, DXcv(xcurve_in(piece)), std::back_inserter(elems), pl);
+      try {
+        CGAL::zone(m_arr, DXcv(xcurve_in(piece)), std::back_inserter(elems), pl);
+      } catch (const std::bad_variant_access&) {
+        throw_zone_overlap_error();
+      }
       for (const ZoneElem& e : elems) {
         if (const auto* v = std::get_if<VHandle>(&e)) out.push_back(Located::vertex(track_v(*v)));
         else if (const auto* h = std::get_if<HHandle>(&e)) out.push_back(Located::halfedge(track_h(*h)));
@@ -1014,11 +1227,16 @@ class ArrImpl final : public ArrBase {
 
   bool do_intersect(const Geom& c) override {
     sync();
+    reject_unsweepable(c);
     Default_pl pl(m_arr);
-    if (is_xcurve_box(c)) return CGAL::do_intersect(m_arr, DXcv(xcurve_in(c)), pl);
-    Geom store;
-    const Curve_2& cv = curve_in(c, store);
-    return CGAL::do_intersect(m_arr, Data_curve_2(cv, nullptr), pl);
+    try {
+      if (is_xcurve_box(c)) return CGAL::do_intersect(m_arr, DXcv(xcurve_in(c)), pl);
+      Geom store;
+      const Curve_2& cv = curve_in(c, store);
+      return CGAL::do_intersect(m_arr, Data_curve_2(cv, nullptr), pl);
+    } catch (const std::bad_variant_access&) {
+      throw_zone_overlap_error();
+    }
   }
 
   /// CGAL precondition (sphere kind): same restriction as batched_locate() — the vertical
@@ -1027,6 +1245,17 @@ class ArrImpl final : public ArrBase {
   /// decomposes fine, one with a vertex at the north pole raises the CGAL precondition.
   void decompose(std::vector<VerticalDecompositionEntry>& out) const override {
     sync();
+    if constexpr (Types::is_sphere) {
+      // CGAL raises `p1.is_no_boundary()` (Arr_geodesic_arc_on_sphere_traits_2.h:1038, from
+      // Arr_vert_decomp_ss_visitor::after_handle_event) as soon as ANY vertex sits on a pole or
+      // on the identification meridian.  Report our own documented error instead (O(V) scan).
+      for (auto v = arr().vertices_begin(); v != arr().vertices_end(); ++v)
+        if (v->parameter_space_in_x() != CGAL::ARR_INTERIOR ||
+            v->parameter_space_in_y() != CGAL::ARR_INTERIOR)
+          throw_error(ErrorCode::Unsupported,
+                      "sphere: vertical decomposition requires every vertex to be in the interior "
+                      "of the parameter space (no pole, no identification vertex)");
+    }
     using Cell = std::variant<VCHandle, HCHandle, FCHandle>;
     using VertT = std::optional<Cell>;
     using Entry = std::pair<VCHandle, std::pair<VertT, VertT>>;
@@ -1057,14 +1286,26 @@ class ArrImpl final : public ArrBase {
 
   // ---- overlay -----------------------------------------------------------
   void overlay_with(const ArrBase& other, ArrBase& result, void* user, OverlayFn fn) const override {
+    reject_reentrant("overlay");
     const ArrImpl* b = as_impl(other);
     ArrImpl* r = as_impl_mut(result);
+    b->reject_reentrant("overlay");
+    r->reject_reentrant("overlay");
     if (r == this || r == b)
       throw_error(ErrorCode::InvalidArgument, "the overlay result must be a distinct arrangement");
     if (!r->m_arr.is_empty() || r->m_arr.number_of_curves() != 0)
       throw_error(ErrorCode::InvalidArgument, "the overlay result arrangement must be empty");
     sync();
     b->sync();
+    // The overlay sweep meets A's curves with B's; each set is internally safe (every insertion
+    // path pre-checks), but the union may not be.
+    if (ops().needs_sweep_precheck()) {
+      std::vector<Geom> other_curves;
+      other_curves.reserve(b->m_arr.number_of_edges());
+      for (auto eit = b->arr().edges_begin(); eit != b->arr().edges_end(); ++eit)
+        other_curves.push_back(box_xcurve(eit->curve()));
+      reject_unsweepable(other_curves.data(), other_curves.size());
+    }
     OverlayTraits ovl(this, b, r, user, fn);
     CGAL::overlay(m_arr, b->m_arr, r->m_arr, ovl);
     r->rescan();
@@ -1184,6 +1425,367 @@ class ArrImpl final : public ArrBase {
     ops().make_x_monotone(c, out);
   }
 
+  // ---- CGAL 6.1 guards ---------------------------------------------------
+
+  /// CGAL_TRAPS_CHECKLIST "Arrangement core": inserting an UNBOUNDED curve (a line or a ray) that
+  /// OVERLAPS an existing edge aborts inside `Arr_linear_traits_2::Construct_min_vertex_2`
+  /// (`CGAL_precondition(cv.has_left())`, Arr_linear_traits_2.h:689) as soon as the overlap has
+  /// no left endpoint.  Only the Linear kind has unbounded curves, so this is a no-op everywhere
+  /// else and costs nothing for a bounded input curve.
+  ///
+  /// Two deviations from the checklist wording, both documented here:
+  ///  * the candidate edges are found by scanning the arrangement's edges rather than by
+  ///    `CGAL::zone()`, because zone() drives exactly the same insertion machinery and trips the
+  ///    same precondition on the offending input before it could report anything.  The scan is
+  ///    O(E) and only runs for an unbounded input curve;
+  ///  * only an overlap that CGAL actually mishandles is refused.  For the INCREMENTAL path
+  ///    (`aggregate == false`) that is an overlap without a left endpoint, exactly the
+  ///    `cv.has_left()` precondition; an overlap bounded on the left (inserting the ray from
+  ///    (2,0) towards (5,0) into an arrangement holding the line y = 0) is legal and CGAL gets
+  ///    it right.  The AGGREGATE sweep (`aggregate == true`, used by insert_curves) is stricter:
+  ///    it also asserts `! e->is_fictitious()` (Arrangement_on_surface_2_impl.h:1517) when the
+  ///    overlap is unbounded on the RIGHT, so both ends are checked there.  An overlap that is
+  ///    bounded at both ends (an unbounded curve overlapping a bounded edge) is fine either way.
+  void reject_unbounded_overlap(const Geom& c, bool aggregate) {
+    if constexpr (!Types::is_unbounded) {
+      (void)c;
+      (void)aggregate;
+    } else {
+      if (m_arr.number_of_edges() == 0) return;
+      const KindOps& o = ops();
+      if (o.curve_is_bounded(c)) return;
+      std::vector<Geom> pieces;
+      split_into_xcurves(c, pieces);
+      std::vector<IntersectionResult> res;
+      for (const Geom& piece : pieces) {
+        if (piece.type == GeomType::Point) continue;
+        for (auto eit = arr().edges_begin(); eit != arr().edges_end(); ++eit) {
+          const X_monotone_curve_2& ecv = eit->curve();
+          o.intersect(piece, box_xcurve(ecv), res);
+          for (const IntersectionResult& r : res) {
+            if (r.is_point) continue;
+            // `cv.has_left()` (Arr_linear_traits_2.h:689) is false exactly when the overlap's
+            // minimal end lies on an open boundary; the aggregate sweep breaks on an open
+            // maximal end as well.
+            const bool left_open = o.parameter_space_in_x(r.overlap, ARR_MIN_END) != ARR_INTERIOR ||
+                                   o.parameter_space_in_y(r.overlap, ARR_MIN_END) != ARR_INTERIOR;
+            const bool right_open = o.parameter_space_in_x(r.overlap, ARR_MAX_END) != ARR_INTERIOR ||
+                                    o.parameter_space_in_y(r.overlap, ARR_MAX_END) != ARR_INTERIOR;
+            if (left_open || (aggregate && right_open))
+              throw_error(ErrorCode::Unsupported,
+                          "CGAL 6.1 cannot insert an unbounded curve overlapping an existing edge");
+          }
+        }
+      }
+    }
+  }
+
+  /// Sweep pre-flight (KindOps::check_sweepable): hands CGAL's sweep-line / zone machinery the
+  /// complete set of curves it is about to work on — the arrangement's edge curves plus the
+  /// `added` ones — so that the kind can refuse a configuration CGAL 6.1 handles by corrupting
+  /// memory.  Only the BEZIER kind has such a configuration (a curve through another curve's
+  /// SELF-intersection point, see KindOps::check_sweepable and the checklist); every other kind
+  /// answers `needs_sweep_precheck() == false` and pays one virtual call.
+  ///
+  /// Every entry point that lets a NEW curve into the arrangement calls this, which gives the
+  /// invariant "an arrangement never holds a dangerous pair of supporting curves"; the sweeps
+  /// that take no new curve (decompose, batched_locate) are safe by that invariant, and
+  /// overlay_with — which does bring two independently safe sets together — checks the union.
+  /// modify_edge / split_edge / merge_edge go through reject_unsweepable_replacement() below,
+  /// which reaches the same conclusion in O(1) while their CGAL precondition holds.
+  void reject_unsweepable(const Geom* added, std::size_t n_added) const {
+    const KindOps& o = ops();
+    if (!o.needs_sweep_precheck()) return;
+    std::vector<Geom> all;
+    all.reserve(m_arr.number_of_edges() + n_added);
+    for (auto eit = arr().edges_begin(); eit != arr().edges_end(); ++eit)
+      all.push_back(box_xcurve(eit->curve()));
+    for (std::size_t i = 0; i < n_added; ++i) all.push_back(added[i]);
+    o.check_sweepable(all);
+  }
+  void reject_unsweepable(const Geom& added) const { reject_unsweepable(&added, 1); }
+
+  /// O(1) form of the pre-flight for modify_edge / split_edge / merge_edge.  CGAL's documented
+  /// precondition for those three is that the supplied x-monotone curves are the edge curve
+  /// itself, its two halves, or the union of two edges — i.e. that they carry a SUPPORTING curve
+  /// the arrangement already holds.  When that is the case no new pair of supporting curves can
+  /// appear and there is nothing for check_sweepable() to find, so the O(E) scan is skipped; a
+  /// caller that violates the precondition (or a kind that cannot answer
+  /// KindOps::supporting_curve_id) falls back to the full pre-flight instead of into undefined
+  /// behaviour.  `support` lists the ids of the edge curves being replaced.
+  void reject_unsweepable_replacement(const Geom* added, std::size_t n_added,
+                                      const std::uint64_t* support, std::size_t n_support) const {
+    const KindOps& o = ops();
+    if (!o.needs_sweep_precheck()) return;
+    for (std::size_t i = 0; i < n_added; ++i) {
+      const std::uint64_t id = o.supporting_curve_id(added[i]);
+      bool known = false;
+      for (std::size_t j = 0; j < n_support && !known; ++j) known = (id != 0 && id == support[j]);
+      if (!known) {                       // a supporting curve the arrangement may not hold
+        reject_unsweepable(added, n_added);
+        return;
+      }
+    }
+  }
+
+  /// CGAL 6.1 bug reached by zone() / do_intersect() on the BEZIER kind: when the query curve
+  /// OVERLAPS an existing edge, `Arrangement_zone_2::compute_zone()` sets m_found_overlap and
+  /// then does `std::get<X_monotone_curve_2>(*_compute_next_intersection(...))`
+  /// (Arrangement_zone_2_impl.h:214) on a variant that holds an intersection POINT, throwing
+  /// std::bad_variant_access out of CGAL.  Reported as our documented Unsupported error rather
+  /// than as an opaque RuntimeError (measured only for Bezier; the check is generic and free).
+  [[noreturn]] static void throw_zone_overlap_error() {
+    throw_error(ErrorCode::Unsupported,
+                std::string(kind_name(Types::kind)) +
+                    ": CGAL 6.1 cannot compute the zone of a curve that overlaps an existing "
+                    "edge (std::bad_variant_access in Arrangement_zone_2)");
+  }
+
+  /// CGAL_TRAPS_CHECKLIST "Sphere kind" / traits_geodesic_sphere.md gotcha G4: removing a vertex
+  /// that lies on a pole or on the identification curve leaves the spherical topology traits'
+  /// `north_pole()/south_pole()/m_boundary_vertices` dangling, and the NEXT insertion SIGSEGVs.
+  /// Refuse instead.  No-op for every planar kind.
+  void reject_boundary_vertex_removal(VHandle v, const char* what) const {
+    if constexpr (!Types::is_sphere) {
+      (void)v; (void)what;
+    } else {
+      if (v->parameter_space_in_x() != CGAL::ARR_INTERIOR ||
+          v->parameter_space_in_y() != CGAL::ARR_INTERIOR)
+        throw_error(ErrorCode::Unsupported,
+                    std::string("sphere: ") + what +
+                        " is not supported for a vertex on a pole or on the identification curve "
+                        "(it would leave the topology traits with dangling pointers)");
+    }
+  }
+
+  /// CGAL_TRAPS_CHECKLIST "Arrangement core": `insert_at_vertices(cv, v1, v2)` frees v1's
+  /// isolated-vertex record (`f1->erase_isolated_vertex(iv1); _dcel().delete_isolated_vertex(iv1)`,
+  /// Arrangement_on_surface_2_impl.h:1026-1027) and only AFTERWARDS asserts that the two vertices
+  /// lie in the same face (:1050 for two isolated vertices, :1081 for an isolated one joined to an
+  /// incident one).  When that assertion throws — this build keeps the CGAL checks on — the vertex
+  /// still reports `is_isolated() == true` while its `isolated_vertex()` pointer is dangling, so
+  /// `Vertex.face`, `Face.isolated_vertices()`, `remove_isolated_vertex()` and `is_valid()` all
+  /// read freed memory (SIGSEGV); with the checks off CGAL silently links an edge across two
+  /// different faces.  Both containment conditions are therefore replicated HERE, before CGAL
+  /// touches anything.  Nothing is checked when neither vertex is isolated: CGAL deletes no
+  /// record on that path and its own preconditions are then harmless.
+  void reject_bad_insert_at_vertices(VHandle a, VHandle b) const {
+    const bool ia = a->is_isolated(), ib = b->is_isolated();
+    if (!ia && !ib) return;
+    if (ia && ib) {
+      if (a->face() != b->face())
+        throw_error(ErrorCode::InvalidArgument,
+                    "insert_at_vertices: both vertices are isolated but lie inside different "
+                    "faces (CGAL requires the same face)");
+      return;
+    }
+    VHandle iso = ia ? a : b;
+    VHandle inc = ia ? b : a;
+    if (inc->degree() == 0) return;   // a degree-0, non-isolated vertex: nothing to compare with
+    auto circ = inc->incident_halfedges();
+    auto first = circ;
+    do {
+      if (circ->face() == iso->face()) return;
+      ++circ;
+    } while (circ != first);
+    throw_error(ErrorCode::InvalidArgument,
+                "insert_at_vertices: the isolated vertex does not lie in a face incident to the "
+                "other vertex, so the new curve would cross the arrangement");
+  }
+
+  /// Inside `before_remove_vertex` CGAL has ALREADY deleted the halfedges around the vertex —
+  /// `_remove_edge` does `_dcel().delete_edge(he1)` before notifying
+  /// (Arrangement_on_surface_2_impl.h:4523/4539) and `_merge_edge` re-links `he1` before it
+  /// notifies (:1721-1723) — while `is_isolated()` still answers false.  `degree()`,
+  /// `incident_halfedges()` and everything routed through them then walk freed / half-relinked
+  /// records and SEGFAULT.  A vertex removed through `remove_isolated_vertex()` is NOT affected
+  /// (there the notification comes first, :1491), so the guard only fires for a non-isolated one.
+  void reject_dead_vertex_ring(VH v, VHandle h, const char* what) const {
+    if (v.p != nullptr && v.p == m_no_ring_v && !h->is_isolated())
+      throw_error(ErrorCode::Unsupported,
+                  std::string("vertex ") + what +
+                      " is not available inside before_remove_vertex: CGAL has already deleted "
+                      "the halfedges incident to this vertex (its point, id, data and "
+                      "is_isolated are still readable)");
+  }
+
+  /// Nothing may modify an arrangement while a Python observer or overlay callback is running:
+  /// CGAL is then in the middle of a DCEL modification and a re-entrant clear() / assign() /
+  /// insert() / remove_curve() SEGFAULTs (measured: the with-history observer inserts a halfedge
+  /// into a Curve_halfedges node that clear() has just destroyed) or hangs forever.  `m_in_notify`
+  /// already marks that window, so use it as a hard gate.
+  void reject_reentrant(const char* what) const {
+    if (m_in_notify > 0)
+      throw_error(ErrorCode::Unsupported,
+                  std::string(what) +
+                      ": the arrangement cannot be modified from inside an observer or overlay "
+                      "callback (CGAL is in the middle of a modification); callbacks are "
+                      "read-only with respect to the arrangements they are given");
+  }
+
+  /// CGAL_TRAPS_CHECKLIST "Sphere kind": a curve LYING ON the identification meridian cannot be
+  /// inserted once the arrangement crosses that meridian — CGAL raises `f == f2` ("The two
+  /// halfedges must share the same incident face", Arrangement_on_surface_2_impl.h:2699) from
+  /// inside `_insert_at_vertices`, i.e. in the MIDDLE of the DCEL surgery, leaving the curve
+  /// half-inserted; the next insertions then fail and eventually SIGSEGV.  With the checks off it
+  /// links two halfedges on different faces instead.  The offending x-monotone piece is exactly
+  /// the one whose BOTH ends lie on the left/right boundary of the parameter space (a harmless
+  /// wrap-around piece has only one such end).  No-op for every planar kind.
+  void reject_identification_curve(const Geom* cs, std::size_t n) const {
+    if constexpr (!Types::is_sphere) {
+      (void)cs; (void)n;
+    } else {
+      if (m_arr.is_empty()) return;   // an empty arrangement takes any single curve set
+      const KindOps& o = ops();
+      bool on_identification = false;
+      std::vector<Geom> pieces;
+      for (std::size_t i = 0; i < n && !on_identification; ++i) {
+        split_into_xcurves(cs[i], pieces);
+        for (const Geom& piece : pieces) {
+          if (piece.type == GeomType::Point) continue;
+          if (o.parameter_space_in_x(piece, ARR_MIN_END) != ARR_INTERIOR &&
+              o.parameter_space_in_x(piece, ARR_MAX_END) != ARR_INTERIOR) {
+            on_identification = true;
+            break;
+          }
+        }
+      }
+      if (!on_identification) return;
+      // The abort needs the arrangement to already CROSS the identification curve, which is
+      // exactly "some vertex does not lie in the interior of the parameter space" (every
+      // crossing edge creates such a vertex, and nothing else does).
+      for (auto v = arr().vertices_begin(); v != arr().vertices_end(); ++v)
+        if (v->parameter_space_in_x() != CGAL::ARR_INTERIOR)
+          throw_error(ErrorCode::Unsupported,
+                      "sphere: CGAL 6.1 cannot insert a curve lying ON the identification "
+                      "meridian into an arrangement that already crosses it — it aborts in the "
+                      "middle of the DCEL surgery (f == f2, "
+                      "Arrangement_on_surface_2_impl.h:2699) and leaves the arrangement "
+                      "half-built; insert the whole curve set with a single insert() call on an "
+                      "empty arrangement instead");
+    }
+  }
+
+  // ---- CGAL 6.1 curve-history repair -------------------------------------
+  //
+  // `Curve_halfedges_observer` (Arrangement_on_surface_with_history_2.h:246-338) keeps the
+  // with-history bookkeeping symmetric by UNregistering an edge in `before_*` and REregistering
+  // it in `after_*`.  An exception thrown between the two halves (CGAL 6.1 raises one from an
+  // attached trapezoidal-map point location on ANY edge merge, Td_active_vertex.h:168) leaves the
+  // two directions of the relation disagreeing: the curve's halfedge set no longer contains the
+  // edge although the edge still names the curve.  `remove_curve()` on such a curve then FREES the
+  // Curve_halfedges node while halfedges still point at it, and the next copy()/assign()/overlay()
+  // dereferences the freed node (SIGSEGV inside Curve_halfedges::Less_halfedge_handle).
+  //
+  // The repair is deferred to the next sync() so that it never runs while the stack is unwinding
+  // (the DCEL may still be mid-surgery there).
+
+  /// True when every edge names exactly the live curves whose halfedge set contains it.
+  bool history_is_consistent() const {
+    Arr& a = arr();
+    std::unordered_map<const void*, std::unordered_set<const void*>> induced;
+    for (auto c = a.curves_begin(); c != a.curves_end(); ++c) {
+      std::unordered_set<const void*>& s = induced[static_cast<const void*>(&*c)];
+      for (auto it = a.induced_edges_begin(c); it != a.induced_edges_end(c); ++it) {
+        HHandle h = *it;
+        s.insert(static_cast<const void*>(&*h));
+        s.insert(static_cast<const void*>(&*h->twin()));
+      }
+    }
+    std::size_t named = 0;
+    for (auto e = a.edges_begin(); e != a.edges_end(); ++e) {
+      HHandle h(e);
+      for (auto di = h->curve().data().begin(); di != h->curve().data().end(); ++di) {
+        ++named;
+        auto it = induced.find(static_cast<const void*>(*di));
+        if (it == induced.end()) return false;                       // dangling curve pointer
+        if (it->second.find(static_cast<const void*>(&*h)) == it->second.end()) return false;
+      }
+    }
+    std::size_t total = 0;
+    for (const auto& kv : induced) total += kv.second.size() / 2;
+    return total == named;
+  }
+
+  /// Restore the symmetry described above.  Uses only the public
+  /// `Arr_with_history_accessor::connect_curve_edge` (which does `cv._insert(he)` plus
+  /// `he->curve().data().insert(&cv)`) and `_Unique_list::erase` for the dangling direction.
+  void repair_history() const {
+    Arr& a = arr();
+    std::unordered_map<const void*, std::unordered_set<const void*>> induced;
+    std::unordered_map<const void*, Curve_handle> nodes;
+    for (auto c = a.curves_begin(); c != a.curves_end(); ++c) {
+      const void* key = static_cast<const void*>(&*c);
+      nodes.emplace(key, Curve_handle(c));
+      std::unordered_set<const void*>& s = induced[key];
+      for (auto it = a.induced_edges_begin(c); it != a.induced_edges_end(c); ++it) {
+        HHandle h = *it;
+        s.insert(static_cast<const void*>(&*h));
+        s.insert(static_cast<const void*>(&*h->twin()));
+      }
+    }
+    // The accessor must be instantiated with the ON-SURFACE with-history class: that is the type
+    // `Curve_halfedges` declares as its friend, and for the six planar kinds `Arr` is the DERIVED
+    // Arrangement_with_history_2, which is NOT a friend.
+    using Aos_wh = CGAL::Arrangement_on_surface_with_history_2<
+        typename Arr::Geometry_traits_2, typename Arr::Base_topology_traits>;
+    CGAL::Arr_with_history_accessor<Aos_wh> acc(a);
+    for (auto e = a.edges_begin(); e != a.edges_end(); ++e) {
+      HHandle h(e);
+      std::vector<Curve_halfedges*> dangling, lost;
+      for (auto di = h->curve().data().begin(); di != h->curve().data().end(); ++di) {
+        Curve_halfedges* p = static_cast<Curve_halfedges*>(*di);
+        auto it = induced.find(static_cast<const void*>(p));
+        if (it == induced.end()) dangling.push_back(p);
+        else if (it->second.find(static_cast<const void*>(&*h)) == it->second.end())
+          lost.push_back(p);
+      }
+      for (Curve_halfedges* p : dangling) h->curve().data().erase(p);
+      for (Curve_halfedges* p : lost) {
+        auto it = nodes.find(static_cast<const void*>(p));
+        if (it != nodes.end()) acc.connect_curve_edge(it->second, h);
+      }
+    }
+  }
+
+  /// RAII: when the guarded operation leaves through an exception, schedule the history repair
+  /// for the next sync() (running it here, during unwinding, would walk a DCEL that CGAL may
+  /// still have half-modified).
+  struct RepairOnThrow {
+    const ArrImpl* self;
+    int depth;
+    explicit RepairOnThrow(const ArrImpl* s) : self(s), depth(std::uncaught_exceptions()) {}
+    ~RepairOnThrow() {
+      if (std::uncaught_exceptions() > depth) {
+        self->m_history_dirty = true;
+        self->m_dirty = true;
+      }
+    }
+  };
+
+  /// RAII: CGAL 6.1's `Arr_trapezoid_ric_point_location` is an observer whose
+  /// `before_merge_edge` handler raises `ptr()->v == ptr()->cw_he->source()`
+  /// (Arr_point_location/Td_active_vertex.h:168) on EVERY edge merge — measured for segment,
+  /// polyline, circle_segment, conic and bezier.  Because the exception escapes between the
+  /// with-history observer's unregister and re-register halves it also corrupts the curve
+  /// history (see repair_history()).  Detach the structure around a merging operation and
+  /// rebuild it afterwards, which is O(size) but correct; the strategy therefore stays usable
+  /// and `attach_point_location("trapezoid")` keeps its documented "stays up to date" contract.
+  struct TrapGuard {
+    ArrImpl* self;
+    bool had = false;
+    explicit TrapGuard(ArrImpl* s) : self(s) {
+      if constexpr (Policy::supports_trapezoid) {
+        if (s->m_pl_trap) { s->m_pl_trap.reset(); had = true; }
+      }
+    }
+    ~TrapGuard() {
+      if constexpr (Policy::supports_trapezoid) {
+        if (had) { try { self->m_pl_trap.reset(new Trap_pl(self->m_arr)); } catch (...) {} }
+      }
+    }
+  };
+
   // ---- const access to the arrangement -----------------------------------
   //
   // Every "read-only" traversal in CGAL mutates something (Halfedge::inner_ccb() path-compresses
@@ -1266,7 +1868,54 @@ class ArrImpl final : public ArrBase {
   // after_clear / after_assign / after_attach / after_global_change, because the aggregate sweep
   // insertions build the DCEL without a usable per-element notification stream.  It is deferred
   // (m_dirty) so that a loop of N insertions does not cost O(N * size).
-  void sync() const { if (m_dirty && m_in_notify == 0) rescan(); }
+  void sync() const {
+    if (m_in_notify != 0) return;
+    if (m_history_dirty) {
+      m_history_dirty = false;
+      try { repair_history(); } catch (...) {}
+    }
+    if (m_dirty) rescan();
+  }
+
+  /// Drop every element id copied from ANOTHER arrangement.  `assign()` copies the whole extended
+  /// DCEL, ElementData::id included, and those ids were handed out by the SOURCE arrangement: they
+  /// can collide with ids this arrangement issued earlier, and then a stale handle whose record
+  /// address happens to be reused answers `is_valid() == true` and silently resolves to a
+  /// different element (measured with a randomized assign() fuzz).  Clearing them makes rescan()
+  /// issue fresh ones from `m_next_id`, which is NEVER reset, so ids stay unique over the whole
+  /// life of this arrangement and `Arrangement.assign`'s documented contract ("every handle into
+  /// this arrangement becomes invalid") holds.
+  void renumber() const {
+    Arr& a = arr();
+    for (auto v = a.vertices_begin(); v != a.vertices_end(); ++v) v->data().id = 0;
+    for (auto h = a.halfedges_begin(); h != a.halfedges_end(); ++h) h->data().id = 0;
+    for (auto f = a.faces_begin(); f != a.faces_end(); ++f) f->data().id = 0;
+    if constexpr (Types::is_unbounded) {
+      // The fictitious face, its halfedges and the vertices at infinity are invisible to the
+      // filtered iterators above; rescan() reaches them through the fictitious face's CCBs.
+      FHandle ff = a.fictitious_face();
+      ff->data().id = 0;
+      clear_ccb_ids(ff);
+    }
+    m_curve_ids.clear();
+  }
+
+  void clear_ccb_ids(FHandle f) const {
+    for (auto o = f->outer_ccbs_begin(); o != f->outer_ccbs_end(); ++o) clear_ccb_ids_one(*o);
+    for (auto o = f->inner_ccbs_begin(); o != f->inner_ccbs_end(); ++o) clear_ccb_ids_one(*o);
+    for (auto v = f->isolated_vertices_begin(); v != f->isolated_vertices_end(); ++v)
+      VHandle(v)->data().id = 0;
+  }
+  void clear_ccb_ids_one(Ccb_circ start) const {
+    Ccb_circ c = start;
+    do {
+      HHandle h(c);
+      h->data().id = 0;
+      h->twin()->data().id = 0;
+      h->target()->data().id = 0;
+      ++c;
+    } while (c != start);
+  }
 
   void rescan() const {
     m_dirty = false;
@@ -1324,10 +1973,36 @@ class ArrImpl final : public ArrBase {
 
   // ---- point location helpers -------------------------------------------
   void require_pl(int strategy) const {
-    if (!supports_point_location(strategy))
-      throw_error(ErrorCode::Unsupported,
-                  std::string("point-location strategy '") + point_location_name(strategy) +
-                      "' is not available for kind '" + kind_name(Types::kind) + "'");
+    if (supports_point_location(strategy)) return;
+    // Distinguish "this kind never offers the strategy" from "this ARRANGEMENT currently
+    // cannot use it" (landmarks on an unbounded-planar arrangement, see landmarks_usable()).
+    if constexpr (Policy::supports_landmarks) {
+      if (strategy == PL_LANDMARKS)
+        throw_error(ErrorCode::Unsupported,
+                    "point-location strategy 'landmarks' is not available while the arrangement "
+                    "contains an unbounded edge: CGAL 6.1 reads the null point of a vertex at "
+                    "infinity (Arr_landmarks_pl_impl.h:414) and walks off the fictitious outer "
+                    "ccb (:533).  It is available again once no ray or line is left");
+    }
+    throw_error(ErrorCode::Unsupported,
+                std::string("point-location strategy '") + point_location_name(strategy) +
+                    "' is not available for kind '" + kind_name(Types::kind) + "'");
+  }
+
+  /// Whether the LANDMARKS strategy may be used on THIS arrangement right now.  Compile-time
+  /// true for every bounded kind that offers landmarks at all; for the unbounded-planar kind
+  /// (Linear) it additionally requires that no unbounded edge is present, which is exactly
+  /// `number_of_vertices_at_infinity() == 0` (every ray/line end creates one such vertex, and
+  /// nothing else does).  See KindPolicy<LinearTypes>::supports_landmarks for the two CGAL 6.1
+  /// bugs this avoids and for the measurements.  O(1).
+  bool landmarks_usable() const {
+    if constexpr (!Policy::supports_landmarks) {
+      return false;
+    } else if constexpr (!impl::has_vertices_at_infinity_v<Arr>) {
+      return true;
+    } else {
+      return m_arr.number_of_vertices_at_infinity() == 0;
+    }
   }
 
   Located from_pl(const PlResult& r) const {
@@ -1522,6 +2197,11 @@ class ArrImpl final : public ArrBase {
       d.a = a.first; d.a_id = a.second;
       d.b = b.first; d.b_id = b.second;
       d.r = r.first; d.r_id = r.second;
+      // The callback must not touch ANY of the three arrangements: CGAL's overlay sweep is in
+      // the middle of building R while reading A's and B's transient marks, and a re-entrant
+      // clear()/insert() SEGFAULTs or hangs.  Raise the re-entrancy gate on all three for the
+      // duration of the call, so such a callback gets a clean Error(Unsupported).
+      NotifyGuard ga(A), gb(B), gr(R);
       fn(user, d);
     }
 
@@ -1765,6 +2445,16 @@ class ArrImpl final : public ArrBase {
       ObsEventData d = mk(ObsEvent::BeforeSplitFace);
       d.f1 = m_self->track_f(f);
       d.h1 = m_self->track_h(e);
+      // e->face() / e->twin()->face() are dangling here; block he_face for the pair while the
+      // Python callbacks run (CGAL_TRAPS_CHECKLIST, "Observer traces").
+      struct NoFaceGuard {
+        const ArrImpl* self;
+        NoFaceGuard(const ArrImpl* s, const void* a, const void* b) : self(s) {
+          s->m_no_face_he[0] = a;
+          s->m_no_face_he[1] = b;
+        }
+        ~NoFaceGuard() { self->m_no_face_he[0] = nullptr; self->m_no_face_he[1] = nullptr; }
+      } no_face(m_self, d.h1.p, m_self->track_h(e->twin()).p);
       m_self->notify(d);
     }
     void after_split_face(FH_ f, FH_ new_f, bool is_hole) override {
@@ -1920,6 +2610,14 @@ class ArrImpl final : public ArrBase {
     void before_remove_vertex(VH_ v) override {
       ObsEventData d = mk(ObsEvent::BeforeRemoveVertex);
       d.v1 = m_self->track_v(v);
+      // CGAL has already deleted / re-linked the halfedges around a NON-isolated vertex here;
+      // block the ring accessors for the duration of the Python dispatch (see
+      // ArrImpl::reject_dead_vertex_ring).
+      struct NoRingGuard {
+        const ArrImpl* self;
+        NoRingGuard(const ArrImpl* s, const void* p) : self(s) { s->m_no_ring_v = p; }
+        ~NoRingGuard() { self->m_no_ring_v = nullptr; }
+      } no_ring(m_self, d.v1.p);
       m_self->notify(d);
       m_self->untrack_v(v);
     }
@@ -1976,8 +2674,16 @@ class ArrImpl final : public ArrBase {
   mutable std::unordered_map<const void*, std::uint64_t> m_curve_ids;
   mutable std::uint64_t m_next_id = 1;
   mutable bool m_dirty = false;
-  mutable int m_in_notify = 0;      ///< > 0 while a Python observer callback is running
+  mutable bool m_history_dirty = false;   ///< an exception escaped a with-history modification
+  mutable int m_in_notify = 0;      ///< > 0 while a Python observer / overlay callback is running
   mutable const KindOps* m_ops = nullptr;
+
+  /// The two halfedges whose incident-face pointer is dangling while `before_split_face` is
+  /// dispatched to Python (CGAL_TRAPS_CHECKLIST, "Observer traces").  `he_face` refuses them.
+  mutable const void* m_no_face_he[2] = {nullptr, nullptr};
+  /// The vertex whose halfedge ring CGAL has already destroyed while `before_remove_vertex` is
+  /// dispatched to Python.  `vertex_degree` / `vertex_incident_halfedges` refuse it.
+  mutable const void* m_no_ring_v = nullptr;
 
   std::vector<PyObserver> m_py_obs;
   int m_next_token = 1;

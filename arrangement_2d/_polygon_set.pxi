@@ -177,6 +177,21 @@ cdef class PolygonSet:
     The in-place methods (:meth:`join`, :meth:`intersection`, :meth:`difference`,
     :meth:`symmetric_difference`, :meth:`complement`) return ``self``; the operators
     ``|``, ``&``, ``-``, ``^`` and ``~`` return new sets.
+
+    ``bezier`` kind: inserting a polygon, every Boolean operation and the two set-vs-set
+    queries raise :class:`UnsupportedError` when the operands' boundary curves include a
+    curve that passes through ANOTHER curve's own SELF-intersection point (the x-monotone
+    arcs need not touch: CGAL pairs the SUPPORTING curves).  CGAL 6.1 cannot handle that
+    configuration: the shared point is reached by three x-monotone branches at once and
+    ``_Bezier_point_2`` can refine or exactly evaluate a point with at most two
+    (``CGAL_assertion(_origs.size() == 2)``, ``Bezier_point_2.h:1421`` / ``:1603``).
+
+    :meth:`insert` refuses it as well although CGAL's non-intersecting insertion would
+    accept it: the check is what establishes the invariant "a polygon set never holds a
+    dangerous pair", which is what makes :meth:`complement`, :meth:`polygons_with_holes`,
+    :meth:`to_arrangement` and every future sweeping query safe without each needing its
+    own scan -- and it keeps the contract the same as the arrangement's, where the very
+    same pair of curves is refused by every insertion path.
     """
 
     def __cinit__(self, kind="segment"):

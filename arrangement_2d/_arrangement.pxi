@@ -645,6 +645,18 @@ class Observer(object):
 
     An exception raised inside a notification is captured and re-raised from the
     arrangement method that triggered it (CGAL cannot unwind through the sweep).
+
+    **Callbacks are read-only with respect to the arrangement.**  CGAL is in the middle of
+    a DCEL modification while a notification runs, so every mutating method
+    (``clear``, ``assign``, ``insert*``, ``remove*``, ``split_edge``, ``merge_edge``,
+    ``modify_*``, ``attach_point_location`` ...) raises :class:`UnsupportedError` when it is
+    called from inside one.  Without that gate a re-entrant call SEGFAULTs or hangs.
+
+    Two accessors are additionally unavailable in specific notifications, because CGAL has
+    already destroyed what they read: ``e.face`` / ``e.twin.face`` inside
+    :meth:`before_split_face`, and ``v.degree`` / ``v.incident_halfedges()`` /
+    ``v.incident_faces()`` inside :meth:`before_remove_vertex` for a non-isolated vertex.
+    Both raise :class:`UnsupportedError`.
     """
 
     # ---- global operations ------------------------------------------------
@@ -661,7 +673,15 @@ class Observer(object):
 
     # ---- vertices ---------------------------------------------------------
     def before_create_vertex(self, point): """A vertex is about to be created at *point*."""
-    def after_create_vertex(self, v): """Vertex *v* was created."""
+    def after_create_vertex(self, v):
+        """Vertex *v* was created.
+
+        A brand-new vertex has no incident halfedge yet and is not "isolated" either, so
+        ``v.incident_halfedges()`` returns ``[]`` and ``v.degree`` is ``0`` (CGAL's own
+        circulator would dereference a null pointer here).  The same holds in
+        :meth:`after_create_boundary_vertex`, :meth:`before_create_edge` and
+        :meth:`before_split_edge`.
+        """
     def before_create_boundary_vertex(self, geometry, end, ps_x, ps_y):
         """A vertex on the parameter-space boundary is about to be created.
 
@@ -678,7 +698,14 @@ class Observer(object):
     def before_move_isolated_vertex(self, from_face, to_face, v):
         """Isolated vertex *v* is about to move between two faces."""
     def after_move_isolated_vertex(self, v): """Isolated vertex *v* was moved."""
-    def before_remove_vertex(self, v): """Vertex *v* is about to be removed."""
+    def before_remove_vertex(self, v):
+        """Vertex *v* is about to be removed.
+
+        ``v.degree``, ``v.incident_halfedges()`` and ``v.incident_faces()`` raise
+        :class:`UnsupportedError` here when *v* is not isolated: CGAL has already deleted
+        (or re-linked) the halfedges around it and walking that ring SEGFAULTs.
+        ``v.point``, ``v.id``, ``v.data`` and ``v.is_isolated`` are still valid.
+        """
     def after_remove_vertex(self): """A vertex was removed."""
 
     # ---- edges ------------------------------------------------------------
@@ -700,7 +727,16 @@ class Observer(object):
     def after_remove_edge(self): """An edge was removed."""
 
     # ---- faces ------------------------------------------------------------
-    def before_split_face(self, f, e): """Face *f* is about to be split by edge *e*."""
+    def before_split_face(self, f, e):
+        """Face *f* is about to be split by edge *e*.
+
+        ``e.face`` and ``e.twin.face`` (and anything routed through them --
+        ``Vertex.incident_faces()``, ``Face.adjacent_faces()``) raise
+        :class:`UnsupportedError` inside this callback: CGAL has not yet re-linked the
+        incident face of the new edge and reading it SEGFAULTs
+        (docs/dev/CGAL_TRAPS_CHECKLIST.md, "Observer traces").  Everything else on *e*
+        (``curve``, ``source``, ``target``, ``next``, ``prev``, ``ccb()``) is safe.
+        """
     def after_split_face(self, f, new_f, is_hole):
         """Face *f* was split; *new_f* is the new face, *is_hole* says whether it became a hole."""
     def before_merge_face(self, f1, f2, e): """Faces *f1* and *f2* are about to merge (edge *e* disappears)."""
@@ -878,6 +914,13 @@ class OverlayCallbacks(object):
 
     Methods you do not override are skipped entirely.  Any exception raised is re-raised
     from :meth:`Arrangement.overlay` once the sweep has finished.
+
+    **Callbacks are read-only with respect to all three arrangements.**  CGAL's overlay
+    sweep is halfway through building ``R`` while it reads ``A``'s and ``B``'s transient
+    marks, so every mutating method on ``A``, ``B`` or ``R`` raises
+    :class:`UnsupportedError` when called from a callback (a re-entrant ``clear()`` on an
+    input SEGFAULTs, a re-entrant ``insert()`` on the result hangs forever).  Setting
+    ``.data`` on any of the handles is fine -- that is what the callbacks are for.
     """
 
     def vertex_vertex(self, va, vb, vr):
@@ -1030,6 +1073,126 @@ cdef Arrangement _arrangement_from_ptr(unique_ptr[ArrBase]& p):
     return a
 
 
+# ---------------------------------------------------------------------------
+# GC visibility of the Python objects stored in DCEL element data
+# ---------------------------------------------------------------------------
+#
+# `arr2d::ElementData::data` is an OWNING raw PyObject* held by the C++ core, and Python's cycle
+# collector cannot see it.  Storing the user's object there directly therefore leaked every cycle
+# that ran through element data (`face.data = {"arr": arr}` kept the whole arrangement alive for
+# the life of the process, and did not even show up in `gc.garbage`): the collector subtracts only
+# the references its `tp_traverse` walk finds, so the invisible C++ reference always left the
+# object looking externally reachable.  Mirroring the object in a Python dict does NOT fix that --
+# the mirror adds a reference *and* a visit, so the C++ one still tips the balance.
+#
+# What the core stores instead is an opaque, unique KEY object (a bare `object()`), and
+# `Arrangement._data_refs` maps key -> user object.  The key is a root as far as the collector is
+# concerned (its refcount is one higher than the visits), but it references nothing, so it keeps
+# nothing alive; the user object is reachable only through `_data_refs`, which the generated
+# tp_traverse does visit, so a cycle through `.data` is collected normally.  The key dies by plain
+# refcounting when the DCEL that holds it is destroyed.
+#
+# Copying an arrangement copies the KEYS (PyRef increfs them), so `copy()` / `assign()` can
+# transfer the values by looking the copied keys up in the source's map -- see
+# `_rebuild_data_refs`.  Removed elements leave their entry behind (the map owns the key), so the
+# map is rebuilt from the live elements whenever it grows past twice the element count.
+
+cdef object _element_data_get(Arrangement arr, PyRef* r):
+    """The Python object stored on one element (``None`` when there is none)."""
+    cdef void* p = r.get()
+    if p == NULL:
+        return None
+    return arr._data_refs.get(<object>p)
+
+
+cdef int _element_data_set(Arrangement arr, PyRef* r, object value) except -1:
+    """Store *value* on one element, keeping ``_data_refs`` in sync."""
+    cdef void* old = r.get()
+    cdef object key
+    if old != NULL:
+        arr._data_refs.pop(<object>old, None)
+    if value is None:
+        r.set(NULL)
+        return 0
+    key = object()
+    arr._data_refs[key] = value          # the map owns the key AND the value ...
+    r.set(<void*>key)                    # ... and the DCEL owns the key only
+    if len(arr._data_refs) > 64 and \
+            len(arr._data_refs) > 2 * (_abase(arr).number_of_vertices() +
+                                       _abase(arr).number_of_halfedges() +
+                                       _abase(arr).number_of_faces()):
+        _rebuild_data_refs(arr, arr._data_refs)
+    return 0
+
+
+cdef inline int _carry_data(dict m, object src_map, void* p) except -1:
+    """Copy one key's value from *src_map* into the new map, if it has one."""
+    cdef object key
+    if p != NULL:
+        key = <object>p
+        if key in src_map:
+            m[key] = src_map[key]
+    return 0
+
+
+cdef int _carry_fictitious_data(ArrBase* a, dict m, object src_map) except -1:
+    """Same, for the elements the filtered iterators never show.
+
+    Under the unbounded (``linear``) topology the fictitious face, its fictitious halfedges and
+    the vertices at infinity are invisible to ``vertices()`` / ``halfedges()`` / ``faces()``;
+    they are reached through the fictitious face's CCBs (arrangement_core.md gotchas 4-6) and
+    they carry ``.data`` like any other element.
+    """
+    cdef FH ff
+    cdef vector[HH] reps
+    cdef vector[HH] ccb
+    cdef size_t i, j
+    if not a.is_unbounded_kind():
+        return 0
+    ff = a.fictitious_face()
+    _carry_data(m, src_map, a.face_data(ff).get())
+    for outer in (True, False):
+        if outer:
+            a.face_outer_ccbs(ff, reps)
+        else:
+            a.face_inner_ccbs(ff, reps)
+        for i in range(reps.size()):
+            a.he_ccb(reps[i], ccb)
+            for j in range(ccb.size()):
+                _carry_data(m, src_map, a.he_data(ccb[j]).get())
+                _carry_data(m, src_map, a.he_data(a.he_twin(ccb[j])).get())
+                _carry_data(m, src_map, a.vertex_data(a.he_target(ccb[j])).get())
+    return 0
+
+
+cdef int _rebuild_data_refs(Arrangement arr, object src_map) except -1:
+    """Rebuild ``arr._data_refs`` from the keys the live elements carry.
+
+    *src_map* is where the values come from: the source arrangement's map after a copy or an
+    assign (the DCEL copy duplicated its keys), or the arrangement's own map when pruning.
+    """
+    cdef ArrBase* a
+    cdef vector[VH] vs
+    cdef vector[HH] hs
+    cdef vector[FH] fs
+    cdef size_t i
+    cdef dict m = {}
+    if arr.arr.get() != NULL and src_map:
+        a = arr.arr.get()
+        a.vertices(vs)
+        for i in range(vs.size()):
+            _carry_data(m, src_map, a.vertex_data(vs[i]).get())
+        a.halfedges(hs)
+        for i in range(hs.size()):
+            _carry_data(m, src_map, a.he_data(hs[i]).get())
+        a.faces(fs)
+        for i in range(fs.size()):
+            _carry_data(m, src_map, a.face_data(fs[i]).get())
+        _carry_fictitious_data(a, m, src_map)
+    arr._data_refs = m
+    return 0
+
+
 cdef class Arrangement:
     """A 2D arrangement of curves of one geometry :class:`Kind`, with curve history.
 
@@ -1048,6 +1211,7 @@ cdef class Arrangement:
     def __cinit__(self, kind="segment"):
         self._observers = {}
         self._pending = None
+        self._data_refs = {}
         if kind is _NO_INIT:
             self._kind = <Kind>0
             return
@@ -1180,6 +1344,7 @@ cdef class Arrangement:
     def clear(self):
         """Remove everything, leaving an empty arrangement of the same kind."""
         _abase(self).clear()
+        self._data_refs = {}
         _check_pending(self)
 
     def copy(self):
@@ -1192,7 +1357,10 @@ cdef class Arrangement:
         :rtype: Arrangement
         """
         cdef unique_ptr[ArrBase] p = _abase(self).clone()
-        return _arrangement_from_ptr(p)
+        cdef Arrangement out = _arrangement_from_ptr(p)
+        # The DCEL copy duplicated the opaque `.data` keys; map them back to the values.
+        _rebuild_data_refs(out, self._data_refs)
+        return out
 
     def __copy__(self):
         return self.copy()
@@ -1209,11 +1377,14 @@ cdef class Arrangement:
     def assign(self, Arrangement other):
         """Replace the contents of this arrangement with a copy of *other* (same kind).
 
-        Every handle into this arrangement becomes invalid.
+        Every handle into this arrangement becomes invalid: the copied elements are given
+        fresh ids from this arrangement's own counter, so an old handle can never be
+        mistaken for a new element that happens to reuse its address.
         """
         if other is None:
             raise TypeError("expected an Arrangement")
         _abase(self).assign(_abase(other)[0])
+        _rebuild_data_refs(self, other._data_refs)
         _check_pending(self)
 
     # ---- iteration --------------------------------------------------------
@@ -1372,6 +1543,34 @@ cdef class Arrangement:
         recorded in the curve history.
 
         :rtype: Vertex | CurveHandle | list[CurveHandle]
+        :raises UnsupportedError: ``linear`` kind only -- an unbounded curve (a line or a
+            ray) whose overlap with an existing edge is itself unbounded cannot be
+            inserted: CGAL 6.1 aborts on it (``cv.has_left()`` /
+            ``! e->is_fictitious()``).  The arrangement is left untouched.
+        :raises UnsupportedError: ``bezier`` kind only -- a curve that passes through
+            another curve's own SELF-intersection point cannot meet it inside CGAL 6.1.
+            Such a point is reached by three x-monotone branches at once (two of the
+            self-intersecting curve, one of the other), and CGAL's Bezier point can refine
+            or exactly evaluate a point with at most two originating branches
+            (``CGAL_assertion(_origs.size() == 2)``, ``Bezier_point_2.h:1421`` and
+            ``:1603``).  The arrangement is left untouched.  (The memory corruption this
+            configuration also used to cause -- ``_Bezier_cache::get_intersections``
+            indexing an empty vector with a wrapped unsigned counter,
+            ``Bezier_cache.h:458/488`` -- is repaired by arr2d, see
+            ``src/arr2d/include/arr2d/impl/bezier_cache_fix.hpp``.)
+        :raises UnsupportedError: ``bezier`` kind only -- a curve that crosses itself while
+            CGAL 6.1's ``Curve_2::has_no_self_intersections()`` reports it as simple (its
+            angular-span test drops a control-polygon edge antipodal to ``front -> back``).
+            CGAL's sweep short-circuits on that flag, so the arrangement would silently lose
+            the crossings; measured with the quartic ``(-4,-4)(-3,4)(-3,-6)(1,3)(-4,-2)``.
+            The same error covers a straight Bezier whose control points are collinear and
+            whose motion along that line reverses (it overlaps its own image, which no
+            arrangement can represent; CGAL 6.1 either asserts or hangs forever on it).
+        :raises UnsupportedError: ``sphere`` kind only -- a curve lying ON the identification
+            meridian cannot be inserted into a non-empty arrangement: CGAL 6.1 aborts in the
+            middle of the DCEL surgery (``f == f2``,
+            ``Arrangement_on_surface_2_impl.h:2699``) and leaves the arrangement half-built.
+            Insert the whole curve set with one :meth:`insert` call on an empty arrangement.
         """
         if isinstance(obj, Point) or _looks_like_point(obj, self._kind):
             return self.insert_point(obj)
@@ -1387,6 +1586,10 @@ cdef class Arrangement:
             or any iterable of those.
         :returns: one :class:`CurveHandle` per input curve, in input order.
         :rtype: list[CurveHandle]
+        :raises UnsupportedError: ``linear`` kind only -- see :meth:`insert`.  Curves that
+            overlap *each other* are fine; the restriction is about overlapping an edge
+            that is already in the arrangement.  ``bezier`` kind -- see :meth:`insert`;
+            the check covers the whole batch, not only the curves already inserted.
         """
         cdef list items = _convert_curves(curves, self._kind)
         cdef vector[Geom] gs
@@ -1503,7 +1706,15 @@ cdef class Arrangement:
     def insert_at_vertices(self, curve, v1, v2):
         """Insert an x-monotone curve whose two endpoints are the existing vertices *v1*, *v2*.
 
+        The curve must not intersect the arrangement, and when a vertex is isolated it must
+        lie in the right face: two isolated vertices must be in the *same* face, and an
+        isolated vertex joined to an incident one must lie in a face incident to it.  Both
+        containment rules are checked here, because CGAL frees the first vertex's
+        isolated-vertex record *before* it validates them and the resulting dangling pointer
+        crashes every later query on that vertex.
+
         :rtype: Halfedge
+        :raises ValueError: a containment rule is violated.
         """
         cdef VH a = _vh_of(self, v1)
         cdef VH b = _vh_of(self, v2)
@@ -1549,6 +1760,11 @@ cdef class Arrangement:
 
         :returns: the halfedge directed like *he* whose target is the new vertex.
         :rtype: Halfedge
+        :raises ValueError: ``split_edge(he, point)`` with a point that does not lie in the
+            interior of the edge's curve.  arr2d checks this itself -- the geodesic
+            ``Split_2`` has no such precondition at all and would silently build two arcs
+            off the great circle -- so the error is a plain ``ValueError``, not a
+            :class:`PreconditionError` coming from CGAL.
         """
         cdef HH h = _hh_of(self, he)
         cdef Geom p
@@ -1614,6 +1830,9 @@ cdef class Arrangement:
 
         :returns: ``True`` if the vertex was removed.
         :rtype: bool
+        :raises UnsupportedError: ``sphere`` kind, for a vertex on a pole or on the
+            identification curve -- removing it leaves the spherical topology traits with
+            dangling pointers and the next insertion segfaults.
         """
         cdef VH vh = _vh_of(self, v)
         cdef bint ok = _abase(self).remove_vertex(vh)
@@ -1625,6 +1844,12 @@ cdef class Arrangement:
 
         :returns: the face that contained it.
         :rtype: Face
+        :raises ValueError: *v* is not isolated (use :meth:`remove_vertex`).  This is
+            checked here rather than by CGAL, so the check also holds in a build with
+            CGAL's assertions turned off, where CGAL would otherwise read the vertex's
+            halfedge/isolated-vertex union through the wrong member.
+        :raises UnsupportedError: ``sphere`` kind, for a vertex on a pole or on the
+            identification curve (see :meth:`remove_vertex`).
         """
         cdef VH vh = _vh_of(self, v)
         cdef FH f = _abase(self).remove_isolated_vertex(vh)
@@ -1693,6 +1918,10 @@ cdef class Arrangement:
         :returns: one result per input point, **in the input order**
             (CGAL returns them xy-sorted; the core restores the original order).
         :rtype: list[Vertex | Halfedge | Face | None]
+
+        ``sphere`` kind: a query point on a pole or on the identification curve is answered
+        one by one with the naive strategy (CGAL's batched sweep crashes at the north pole),
+        transparently and still in input order.
         """
         cdef vector[Geom] gs
         cdef vector[Located] out
@@ -1711,8 +1940,16 @@ cdef class Arrangement:
     def supports_point_location(self, strategy):
         """Whether *strategy* can be used on this arrangement.
 
-        ``triangulation`` needs a bounded arrangement of segments;
-        ``landmarks``/``naive``/``triangulation`` cannot do ray shooting.
+        Most answers depend only on the kind, but ``landmarks`` on the ``linear`` kind
+        depends on the arrangement's CURRENT content: CGAL 6.1's landmark walk reads the
+        null point of a vertex at infinity (``Arr_landmarks_pl_impl.h:414``) and walks off
+        the fictitious outer ccb (``:533``) whenever an unbounded edge is present, so the
+        strategy is offered exactly while the arrangement holds no ray and no line.
+        Inserting one turns this to ``False`` (an already attached structure then stops
+        being used, including by ``strategy=None``); removing it turns it back to ``True``.
+
+        ``triangulation`` is never offered; ``landmarks``/``naive``/``triangulation``
+        cannot do ray shooting.
 
         :rtype: bool
         """
@@ -1725,6 +1962,16 @@ cdef class Arrangement:
         ``landmarks`` do; note that the landmarks generator rebuilds its whole kd-tree on
         every local change -- point_location_and_decomposition.md gotcha 10 -- so prefer
         aggregate insertion or the trapezoid strategy for incremental work).
+
+        One CGAL 6.1 exception, handled internally: an attached ``trapezoid`` structure
+        raises an assertion on *every* edge merge (``Td_active_vertex.h:168``), so
+        :meth:`merge_edge` and :meth:`remove_vertex` detach it, perform the merge and
+        rebuild it.  That is O(size of the arrangement) per merge -- detach the strategy
+        first if you are about to merge many edges.
+
+        :raises UnsupportedError: if :meth:`supports_point_location` is ``False`` for
+            *strategy* -- for ``landmarks`` on a ``linear`` arrangement that means the
+            arrangement currently contains an unbounded edge.
         """
         _abase(self).attach_point_location(_pl_strategy(strategy))
         _check_pending(self)
@@ -1747,6 +1994,10 @@ cdef class Arrangement:
         Nothing is inserted.  A general (non x-monotone) curve is subdivided first.
 
         :rtype: list[Vertex | Halfedge | Face | None]
+        :raises UnsupportedError: ``bezier`` kind only -- CGAL 6.1's zone algorithm throws
+            ``std::bad_variant_access`` when the query curve *overlaps* an existing edge,
+            and its intersection cache corrupts memory when the query curve passes through
+            an existing curve's own SELF-intersection point (or vice versa).
         """
         cdef Geom c = _as_curve(curve, self._kind, False)
         cdef vector[Located] out
@@ -1762,6 +2013,8 @@ cdef class Arrangement:
         """Whether *curve* intersects any vertex or edge of the arrangement.
 
         :rtype: bool
+        :raises UnsupportedError: ``bezier`` kind only -- same CGAL 6.1 restriction as
+            :meth:`zone`.
         """
         cdef Geom c = _as_curve(curve, self._kind, False)
         cdef bint r = _abase(self).do_intersect(c)
@@ -1777,6 +2030,8 @@ cdef class Arrangement:
             **fictitious halfedge**, not as ``None``
             (point_location_and_decomposition.md gotcha 7) -- test ``.is_fictitious``.
         :rtype: list[tuple[Vertex, object, object]]
+        :raises UnsupportedError: ``sphere`` kind, when any vertex lies on a pole or on the
+            identification curve (CGAL's decomposition sweep asserts there).
         """
         cdef vector[VerticalDecompositionEntry] out
         _abase(self).decompose(out)
@@ -1921,7 +2176,9 @@ cdef class Arrangement:
     def edge_vertex_indices(self):
         """Source/target vertex indices of every edge, in :meth:`edges` order.
 
-        Indices refer to :meth:`vertices` / :meth:`vertex_coordinates`.
+        Indices refer to :meth:`vertices` / :meth:`vertex_coordinates`.  A vertex **at
+        infinity** (only the unbounded ``linear`` kind has them) is not in that list and is
+        reported as ``-1``.
 
         :returns: a numpy array of shape ``(m, 2)`` of integers, or a list of pairs.
         """
@@ -1929,9 +2186,13 @@ cdef class Arrangement:
         _abase(self).edge_vertex_indices(out)
         cdef size_t n = out.size()
         cdef size_t i
+        cdef size_t none = <size_t>-1          # the core's "vertex at infinity" marker
         cdef list flat = []
         for i in range(n):
-            flat.append(out[i])
+            if out[i] == none:
+                flat.append(-1)
+            else:
+                flat.append(out[i])
         if _np is not None:
             return _np.asarray(flat, dtype=_np.int64).reshape((-1, 2))
         cdef list res = []
@@ -2101,6 +2362,8 @@ cdef class Vertex:
         """Number of edges incident to this vertex (``0`` for an isolated vertex).
 
         :rtype: int
+        :raises UnsupportedError: inside an :class:`Observer`'s ``before_remove_vertex(v)``
+            for a non-isolated vertex -- CGAL has already deleted the halfedges around it.
         """
         return _abase(self.arr).vertex_degree(self.h)
 
@@ -2124,7 +2387,13 @@ cdef class Vertex:
     def incident_halfedges(self):
         """The halfedges whose **target** is this vertex, in CGAL's circular order.
 
+        Empty for an isolated vertex and for a brand-new vertex that has no incident
+        halfedge yet (which is what an observer sees in ``after_create_vertex``,
+        ``after_create_boundary_vertex``, ``before_create_edge`` and ``before_split_edge``).
+
         :rtype: list[Halfedge]
+        :raises UnsupportedError: inside an :class:`Observer`'s ``before_remove_vertex(v)``
+            for a non-isolated vertex -- CGAL has already deleted the halfedges around it.
         """
         cdef vector[HH] out
         _abase(self.arr).vertex_incident_halfedges(self.h, out)
@@ -2141,6 +2410,9 @@ cdef class Vertex:
         incident to the halfedges around the vertex, in circular order without repeats.
 
         :rtype: list[Face]
+        :raises UnsupportedError: inside an :class:`Observer`'s ``before_split_face`` (the
+            incident faces are not linked yet) or ``before_remove_vertex`` for a
+            non-isolated vertex (the halfedges are already gone).
         """
         cdef ArrBase* a = _abase(self.arr)
         if a.vertex_is_isolated(self.h):
@@ -2192,21 +2464,17 @@ cdef class Vertex:
         """An arbitrary Python object stored on this vertex (``None`` by default).
 
         The reference is owned by the arrangement and survives :meth:`Arrangement.copy`
-        (the copy shares the same object).
+        (the copy shares the same object).  A reference *back* to the arrangement (or to
+        anything that reaches it) is fine: the arrangement mirrors every stored object in a
+        GC-visible container, so such a cycle is collected normally.
         """
         cdef PyRef* r = &_abase(self.arr).vertex_data(self.h)
-        cdef void* p = r.get()
-        if p == NULL:
-            return None
-        return <object>p
+        return _element_data_get(self.arr, r)
 
     @data.setter
     def data(self, value):
         cdef PyRef* r = &_abase(self.arr).vertex_data(self.h)
-        if value is None:
-            r.set(NULL)
-        else:
-            r.set(<void*>value)
+        _element_data_set(self.arr, r, value)
 
     @property
     def id(self):
@@ -2318,6 +2586,9 @@ cdef class Halfedge:
         """The face incident to this halfedge (the one on its left).
 
         :rtype: Face
+        :raises UnsupportedError: while an :class:`Observer`'s ``before_split_face(f, e)``
+            is running, for *e* and ``e.twin`` -- CGAL has not re-linked their incident
+            face yet and reading it SEGFAULTs.
         """
         return _wrap_face(self.arr, _abase(self.arr).he_face(self.h))
 
@@ -2399,6 +2670,9 @@ cdef class Halfedge:
         An edge covered by several overlapping input curves has several originators.
 
         :rtype: list[CurveHandle]
+        :raises UnsupportedError: for a fictitious halfedge -- it carries no curve at all,
+            so CGAL's ``Halfedge::curve()`` would dereference a null pointer
+            (``Arr_dcel_base.h``; the same refusal as :attr:`curve`).
         """
         cdef vector[CH] out
         _abase(self.arr).originating_curves(self.h, out)
@@ -2413,6 +2687,8 @@ cdef class Halfedge:
         """How many input curves induced this edge.
 
         :rtype: int
+        :raises UnsupportedError: for a fictitious halfedge (see
+            :meth:`originating_curves`).
         """
         return _abase(self.arr).number_of_originating_curves(self.h)
 
@@ -2423,18 +2699,12 @@ cdef class Halfedge:
         The two halfedges of an edge have *independent* data.
         """
         cdef PyRef* r = &_abase(self.arr).he_data(self.h)
-        cdef void* p = r.get()
-        if p == NULL:
-            return None
-        return <object>p
+        return _element_data_get(self.arr, r)
 
     @data.setter
     def data(self, value):
         cdef PyRef* r = &_abase(self.arr).he_data(self.h)
-        if value is None:
-            r.set(NULL)
-        else:
-            r.set(<void*>value)
+        _element_data_set(self.arr, r, value)
 
     @property
     def id(self):
@@ -2741,18 +3011,12 @@ cdef class Face:
     def data(self):
         """An arbitrary Python object stored on this face (``None`` by default)."""
         cdef PyRef* r = &_abase(self.arr).face_data(self.h)
-        cdef void* p = r.get()
-        if p == NULL:
-            return None
-        return <object>p
+        return _element_data_get(self.arr, r)
 
     @data.setter
     def data(self, value):
         cdef PyRef* r = &_abase(self.arr).face_data(self.h)
-        if value is None:
-            r.set(NULL)
-        else:
-            r.set(<void*>value)
+        _element_data_set(self.arr, r, value)
 
     @property
     def id(self):

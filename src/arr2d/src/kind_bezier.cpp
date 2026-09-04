@@ -76,6 +76,8 @@
 //    gotcha 2); everything goes through to_double_correctly_rounded() from number_conv.hpp.
 #include "arr2d/kinds/bezier_types.hpp"
 
+#include <CGAL/convex_hull_2.h>   // CGAL::is_convex_2, for control_polygon_is_convex()
+
 #include "arr2d/impl/kind_ops_base.hpp"
 #include "arr2d/impl/number_conv.hpp"
 #include "arr2d/impl/arr_impl.hpp"
@@ -102,6 +104,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -159,6 +162,238 @@ void retain(const Curve_2& c) {
   if (c.number_of_control_points() == 0) return;   // a default-constructed curve has no rep data
   Retention& r = retention();
   if (r.ids.insert(c.id()).second) r.curves.push_back(c);
+}
+
+// ---------------------------------------------------------------------------
+// Self-intersection registry (CGAL 6.1 memory-corruption guard, see below).
+// Leaked on purpose: the points hold CORE::Expr coordinates and a static-storage CORE value
+// aborts the process at exit (CGAL_TRAPS_CHECKLIST "Process/build").
+// ---------------------------------------------------------------------------
+struct SelfIsect {
+  std::unordered_map<std::size_t, std::vector<Point_2>> map;   ///< Curve_2::id() -> crossings
+  std::unordered_set<std::size_t> undecidable;                 ///< see self_intersection_points()
+};
+
+SelfIsect& self_isect() {
+  static SelfIsect* r = new SelfIsect();
+  return *r;
+}
+
+/// SOUND certificate of simplicity, used INSTEAD of `Curve_2::has_no_self_intersections()`.
+///
+/// CGAL 6.1's flag is `! Bezier_bounding_rational_traits::may_have_self_intersections(ctrl)`
+/// (Bezier_curve_2.h:205), which answers "no self-intersections" when the control polygon is
+/// convex OR when `_compute_angular_span()` claims the control-polygon edge directions span less
+/// than 180 degrees (Bezier_bounding_rational_traits.h:291-308).  The first test is a theorem;
+/// the SECOND ONE IS UNSOUND.  It classifies every edge vector against
+/// `dir = front -> back` with `orientation(v, ORIGIN, dir)`, which cannot tell "same direction"
+/// from "opposite direction": an edge ANTIPODAL to `dir` comes out COLLINEAR and is silently
+/// dropped from the span.  MEASURED with the quartic (-4,-4)(-3,4)(-3,-6)(1,3)(-4,-2), whose
+/// edge directions span 204 degrees but whose second edge (0,-10) is antipodal to
+/// `dir = (0,2)`: CGAL reports `has_no_self_intersections() == true` although the curve crosses
+/// itself twice (exactly, at ~(-3.6153,-1.6270) and ~(-2.5932,-0.7837)).  The consequence is not
+/// only that our guard would miss it: `_Bezier_x_monotone_2::_exact_intersect` short-circuits on
+/// the same flag (Bezier_x_monotone_2.h:2120-2125), so CGAL builds a SILENTLY WRONG arrangement
+/// for that curve — measured V=3 E=2 F=1, i.e. both crossings missing.
+///
+/// The sound replacement, in the same spirit and just as cheap:
+///   (a) all NON-ZERO control-polygon edge vectors lie in one OPEN half-plane {u : u.w > 0}.
+///       The derivative of a degree-n Bezier is the degree-(n-1) Bezier on the control points
+///       n*(P_{i+1} - P_i), so B'(t).w is a Bernstein combination (weights >= 0, summing to 1,
+///       all strictly positive on (0,1)) of strictly positive numbers: B'(t).w > 0, hence
+///       t -> B(t).w is strictly increasing and B is injective.  Exact O(n^2) rational test:
+///       such a `w` exists iff some edge vector has every other one within [0,180) degrees
+///       counterclockwise of it.
+///   (b) otherwise, CGAL's own (sound) convexity test: a convex control polygon gives a convex,
+///       hence simple, Bezier curve.  `CGAL::is_convex_2` also accepts a COLLINEAR control
+///       polygon, so self_intersection_points() screens the reversing straight-line motions out
+///       before reaching it.
+bool control_polygon_in_open_halfplane(const Curve_2& B) {
+  std::vector<std::pair<Rational, Rational>> v;   // non-zero control-polygon edge vectors
+  auto it = B.control_points_begin();
+  const auto end = B.control_points_end();
+  if (it == end) return true;                     // no control points at all
+  Rat_point_2 prev = *it;
+  for (++it; it != end; ++it) {
+    const Rational dx = it->x() - prev.x();
+    const Rational dy = it->y() - prev.y();
+    prev = *it;
+    if (dx != 0 || dy != 0) v.emplace_back(dx, dy);
+  }
+  if (v.empty()) return true;                     // every control point coincides: a single point
+  for (const auto& a : v) {
+    bool all_within = true;
+    for (const auto& b : v) {
+      const Rational cross = a.first * b.second - a.second * b.first;
+      if (cross > 0) continue;                                            // strictly CCW of a
+      if (cross == 0 && (a.first * b.first + a.second * b.second) > 0) continue;   // parallel to a
+      all_within = false;
+      break;
+    }
+    if (all_within) return true;
+  }
+  return false;
+}
+
+bool control_polygon_is_convex(const Curve_2& B) {
+  return CGAL::is_convex_2(B.control_points_begin(), B.control_points_end(), BT::Rat_kernel());
+}
+
+/// n choose k, exactly (n is a Bezier degree, so tiny).
+Integer binomial(std::size_t n, std::size_t k) {
+  if (k > n) return Integer(0);
+  if (k > n - k) k = n - k;
+  Integer r(1);
+  for (std::size_t i = 0; i < k; ++i) {
+    r *= Integer(static_cast<long>(n - i));
+    r /= Integer(static_cast<long>(i + 1));
+  }
+  return r;
+}
+
+/// EXACT injectivity test for a curve whose control points are COLLINEAR.
+///
+/// CGAL_TRAPS_CHECKLIST "Bezier kind" used to list this as OPEN: a Bezier curve whose control
+/// points are collinear and whose motion along that line REVERSES traces the same segment twice,
+/// which no arrangement can represent.  `Curve_2::has_no_self_intersections()` calls it simple
+/// (the control polygon is "convex"), so CGAL's sweep never looks for the overlap and then breaks
+/// in an input-dependent way — measured: (0,0)(3,3)(1,1) raises
+/// `CGAL assertion violation: org != p.originators_end()` (Bezier_x_monotone_2.h:1008) and
+/// (0,0)(4,4)(-1,-1)(2,2) HANGS forever, i.e. a denial of service from ordinary user input.
+/// `CGAL::is_convex_2` cannot tell "convex" from "collinear", so the screen has to run BEFORE
+/// control_polygon_is_convex().
+///
+/// With every control point on the line P0 + s*d the curve is B(t) = P0 + lambda(t)*d, where
+/// lambda is the Bernstein polynomial of the scalars lambda_i = (P_i - P0).d.  B is injective on
+/// [0,1] iff lambda is, i.e. iff lambda' does not change sign there.  A coefficient test is only
+/// SUFFICIENT (the control scalars 0,1,0,1 give lambda'(t) = 3(2t-1)^2 >= 0, a monotone and
+/// perfectly legal curve whose differences alternate — that is why this was left open before), so
+/// decide it exactly: isolate lambda's real roots with the Nt_traits the TU already uses and check
+/// that the sign of lambda' is constant between them.
+///
+/// \return  1 = collinear and injective (safe), 0 = collinear and NOT injective (must be refused),
+///         -1 = the control polygon is not collinear (nothing decided here).
+int collinear_motion_is_injective(const Curve_2& B) {
+  std::vector<Rat_point_2> P(B.control_points_begin(), B.control_points_end());
+  if (P.size() < 2) return 1;
+  std::size_t k = 1;
+  while (k < P.size() && P[k].x() == P[0].x() && P[k].y() == P[0].y()) ++k;
+  if (k == P.size()) return 1;                       // every control point coincides
+  const Rational dx = P[k].x() - P[0].x();
+  const Rational dy = P[k].y() - P[0].y();
+  for (std::size_t i = 1; i < P.size(); ++i) {
+    const Rational ax = P[i].x() - P[0].x();
+    const Rational ay = P[i].y() - P[0].y();
+    if (dx * ay - dy * ax != 0) return -1;           // not collinear
+  }
+
+  const std::size_t n = P.size() - 1;
+  std::vector<Rational> lam(n + 1);
+  for (std::size_t i = 0; i <= n; ++i)
+    lam[i] = (P[i].x() - P[0].x()) * dx + (P[i].y() - P[0].y()) * dy;
+
+  // Bernstein -> monomial:  lambda(t) = sum_i lam_i C(n,i) t^i (1-t)^(n-i).
+  std::vector<Rational> f(n + 1, Rational(0));
+  for (std::size_t i = 0; i <= n; ++i) {
+    if (lam[i] == 0) continue;
+    const Rational ci = Rational(binomial(n, i)) * lam[i];
+    for (std::size_t j = 0; i + j <= n; ++j) {
+      Rational term = ci * Rational(binomial(n - i, j));
+      if (j % 2 == 1) term = -term;
+      f[i + j] += term;
+    }
+  }
+  if (n == 0) return 1;
+  std::vector<Rational> g(n);
+  for (std::size_t d = 0; d < n; ++d) g[d] = f[d + 1] * Rational(static_cast<long>(d + 1));
+
+  Nt_traits nt;
+  Nt_traits::Polynomial gp;
+  Integer denom;
+  if (!nt.construct_polynomial(g.data(), static_cast<unsigned int>(n - 1), gp, denom))
+    return 0;   // lambda' is identically zero: the whole curve is one point, traced forever
+  std::vector<Algebraic> roots;
+  nt.compute_polynomial_roots(gp, std::back_inserter(roots));   // ascending
+  std::vector<Algebraic> bounds;
+  bounds.push_back(Algebraic(0));
+  for (const Algebraic& r : roots) {
+    Algebraic below_one = r - Algebraic(1);
+    if (r.sign() > 0 && below_one.sign() < 0) bounds.push_back(r);
+  }
+  bounds.push_back(Algebraic(1));
+
+  int s = 0;
+  for (std::size_t i = 0; i + 1 < bounds.size(); ++i) {
+    Algebraic mid = (bounds[i] + bounds[i + 1]) / Algebraic(2);
+    Algebraic val = nt.evaluate_at(gp, mid);
+    const int sv = val.sign();
+    if (sv == 0) return 0;                 // lambda' vanishes on a whole interval
+    if (s == 0) s = sv;
+    else if (s != sv) return 0;            // the motion reverses: the curve overlaps itself
+  }
+  return 1;
+}
+
+/// The exact points at which the supporting curve `B` crosses ITSELF (empty for the vast
+/// majority of curves).  Computed through the `id1 == id2` branch of
+/// `_Bezier_cache::get_intersections` (Bezier_cache.h:342-389), which is a completely separate,
+/// SOUND code path from the two-curve pairing loop that the guard below protects against.
+///
+/// `undecidable` collects the curves for which CGAL cannot answer at all: that branch needs a
+/// non-constant X(t) AND a non-constant Y(t) (`CGAL_assertion(degX > 0)` / `(degY > 0)`,
+/// Bezier_cache.h:664/681) and, for degree 1 in both, builds a 0x0 Sylvester matrix and SIGSEGVs
+/// (measured, `_compute_resultant`).  A curve reaches this only when it is a STRAIGHT
+/// axis-parallel motion that REVERSES (a constant coordinate forces every edge vector onto one
+/// axis, and if they were all in an open half-plane the certificate above would already have
+/// answered) — i.e. a curve that overlaps ITSELF along an interval.  check_sweepable() refuses
+/// those outright rather than letting CGAL assert mid-sweep or treat them as simple.
+const std::vector<Point_2>& self_intersection_points(const Curve_2& B) {
+  auto& si = self_isect();
+  auto& m = si.map;
+  auto it = m.find(B.id());
+  if (it != m.end()) return it->second;
+  std::vector<Point_2>& out = m[B.id()];
+  if (control_polygon_in_open_halfplane(B)) return out;          // (a): sound and cheap
+  // (a2) A COLLINEAR control polygon: CGAL::is_convex_2 accepts it, so the exact test below has
+  // to run BEFORE (b).  It decides both the legal case (a monotone motion whose differences
+  // alternate, e.g. the control scalars 0,1,0,1) and the illegal one (a motion that reverses and
+  // therefore traces the same segment twice, which CGAL 6.1 answers with an assertion or an
+  // infinite loop).  This also subsumes the axis-parallel sub-case screened below.
+  {
+    const int inj = collinear_motion_is_injective(B);
+    if (inj == 1) return out;                                    // collinear and injective
+    if (inj == 0) { si.undecidable.insert(B.id()); return out; } // collinear and reversing
+  }
+  Nt_traits nt;
+  if (nt.degree(B.x_polynomial()) < 1 || nt.degree(B.y_polynomial()) < 1) {
+    // A constant coordinate puts every control-polygon edge on one axis, and (a) has already
+    // ruled out their all pointing the same way: this is a straight axis-parallel motion that
+    // REVERSES, i.e. a curve overlapping its own image.  CGAL cannot decide it (see above) and
+    // its own `has_no_self_intersections()` calls it simple because the control points are
+    // collinear, after which the sweep inserts the two coincident halves as separate edges.
+    // Tested BEFORE the convexity certificate (b), which would otherwise accept it.
+    si.undecidable.insert(B.id());
+    return out;
+  }
+  if (control_polygon_is_convex(B)) return out;                  // (b): CGAL's sound test
+  retain(B);   // both caches are keyed by id(): the rep must outlive them
+  bool ovlp = false;
+  const auto& lst = bezier_cache().get_intersections(
+      B.id(), B.x_polynomial(), B.x_norm(), B.y_polynomial(), B.y_norm(),
+      B.id(), B.x_polynomial(), B.x_norm(), B.y_polynomial(), B.y_norm(), ovlp);
+  for (const auto& ip : lst) {
+    // The self-intersection branch also reports the trivial pairs (s, s).
+    if (CGAL::compare(ip.s, ip.t) == CGAL::EQUAL) continue;
+    out.push_back(Point_2(B, ip.s));
+  }
+  return out;
+}
+
+/// True when CGAL 6.1 cannot decide `B`'s self-intersections at all (see above).  Only ever true
+/// after self_intersection_points(B) has run.
+bool self_intersections_undecidable(const Curve_2& B) {
+  self_intersection_points(B);
+  return self_isect().undecidable.count(B.id()) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,28 +1006,160 @@ class BezierOps final : public KindOpsBase<BezierTypes> {
 
   // ------------------------------------------------------- traits workarounds
 
-  /// CGAL's Bezier Split_2 does NOT verify that the split point lies on the curve: its only
-  /// precondition is `p.get_originator(_curve, _xid) != p.originators_end() || p.is_rational()`
-  /// (Bezier_x_monotone_2.h:1291), so ANY free rational point is accepted and produces a corrupt
-  /// pair of subcurves (exact_coordinates_contract.md gotcha 5, verified there with (1000,1000)).
-  /// We therefore check the geometry ourselves before delegating to the generic implementation.
-  void split(const Geom& xc, const Geom& p, Geom& left, Geom& right) const override {
-    const Xcv_2& c = xcurve(xc);
-    const Point_2& pt = point(p);
-    auto in_range = adaptor().is_in_x_range_2_object();
-    if (!in_range(c, pt))
-      invalid("split: the point is not in the x-range of the curve");
-    auto cmp = adaptor().compare_y_at_x_2_object();
-    if (cmp(pt, c) != CGAL::EQUAL)
-      invalid("split: the point does not lie on the curve");
-    // CGAL's documented precondition: p is in the INTERIOR of the curve.
-    auto eq = traits().equal_2_object();
-    if (eq(pt, c.source()) || eq(pt, c.target()))
-      invalid("split: the point is an endpoint of the curve, not an interior point");
-    Base::split(xc, p, left, right);
+  // NOTE: CGAL's Bezier Split_2 does NOT verify that the split point lies on the curve — its only
+  // precondition is `p.get_originator(_curve, _xid) != p.originators_end() || p.is_rational()`
+  // (Bezier_x_monotone_2.h:1291), so ANY free rational point is accepted and produces a corrupt
+  // pair of subcurves (exact_coordinates_contract.md gotcha 5, verified there with (1000,1000)).
+  // The geodesic Split_2 has the same hole.  `KindOpsBase::split` therefore validates the point
+  // for EVERY kind (in-x-range, on the curve, not an endpoint) before calling Split_2, which is
+  // what this override used to do for Bezier alone — hence no override here any more.
+
+  /// CGAL 6.1 guard: a curve that passes through ANOTHER curve's SELF-intersection point.
+  ///
+  /// That configuration trips TWO independent CGAL 6.1 defects, and only the first of them is
+  /// repaired in this project:
+  ///
+  ///  (1) REPAIRED — `_Bezier_cache::get_intersections` pairs the resultant roots of the two
+  ///      SUPPORTING curves assuming a bijection between them (`pts2.erase()` as it goes, and
+  ///      `for (k = n_pts2 - 1; !found && k > 0; k--)` with an UNSIGNED `k`, Bezier_cache.h:458
+  ///      /:488).  A self-intersection point is reached at two parameters, so the two root
+  ///      lists differ in length: depending on which curve got the smaller `Curve_2::id()`
+  ///      either `pts2` runs empty and `k` wraps to 4294967295 to index an EMPTY vector
+  ///      (measured: SIGSEGV) or one of the two pairings is silently dropped (measured:
+  ///      `CGAL_assertion(_is_in_range(t, cache))`, Bezier_x_monotone_2.h:933).
+  ///      `impl/bezier_cache_fix.hpp` replaces that member with a correct many-to-many matching,
+  ///      so NOTHING in this project can reach the out-of-bounds read any more — including this
+  ///      guard itself, which has to call `compare_y_at_x(self-intersection point, other curve)`
+  ///      and therefore goes through `_Bezier_cache::get_intersections` on the very pair it is
+  ///      about to refuse whenever that point is not rational.
+  ///
+  ///  (2) NOT REPAIRED — the shared point is reached by three x-monotone branches (two of the
+  ///      self-intersecting curve, one of the other), so `_Bezier_point_2` accumulates THREE
+  ///      originators, and both `_Bezier_point_2_rep::_refine()`
+  ///      (`CGAL_assertion(_origs.size() == 2)`, Bezier_point_2.h:1421, reached from
+  ///      `fit_to_bbox()` inside `_clip_control_polygon`) and `make_exact()` (same assertion,
+  ///      :1603) can only handle two.  Whether it is reached depends on whether CGAL's
+  ///      approximate isolation happens to suffice — measured: it does for a quadratic or a
+  ///      cubic through the crossing (the arrangement then comes out correct), it does not for a
+  ///      vertical segment through it or for a line that also cuts the loop elsewhere.  Repairing
+  ///      it means generalising CGAL's simultaneous two-curve refinement to k curves, which is
+  ///      real geometry work inside third-party code, so the configuration stays refused.
+  ///
+  /// Detected exactly and refused here.  The same configuration is reached through CGAL's sweep
+  /// (`Arrangement.insert` / `zone` / `do_intersect` / `overlay`), which never calls this method;
+  /// `check_sweepable()` below is the pre-flight guard ArrImpl runs for those entry points.
+  void intersect(const Geom& xc1, const Geom& xc2,
+                 std::vector<IntersectionResult>& out) const override {
+    const Xcv_2& a = xcurve(xc1);
+    const Xcv_2& b = xcurve(xc2);
+    const Curve_2& A = a.supporting_curve();
+    const Curve_2& B = b.supporting_curve();
+    if (A.id() != B.id()) {
+      reject_meeting_at_self_intersection(A, B);
+      reject_meeting_at_self_intersection(B, A);
+    } else if (!self_intersection_points(A).empty()) {
+      // Two pieces of the SAME supporting curve go through CGAL's own self-intersection branch,
+      // which is sound — unless CGAL's has_no_self_intersections() flag wrongly short-circuits it.
+      reject_curve_cgal_calls_simple(A);
+    }
+    Base::intersect(xc1, xc2, out);
+  }
+
+  // ---- sweep pre-flight (KindOps) ------------------------------------------------------
+  //
+  // CGAL's sweep-line and zone code call `Intersect_2` on pairs of x-monotone curves that our
+  // `intersect()` above never sees, so the guard has to run BEFORE the sweep starts, on the
+  // whole set of curves that will meet inside CGAL.  Measured with the LOOP cubic
+  // (-1,0)(3,10)(-3,10)(1,0), which crosses itself at (0,3), and the linear Bezier
+  // (-2,3)-(2,3) through that point: `insert`, `insert_curves`, `zone` and `do_intersect` all
+  // SIGSEGV in ~5 runs out of 6, in either insertion order.
+  bool needs_sweep_precheck() const override { return true; }
+
+  /// O(n) cheap tests (`Curve_2::has_no_self_intersections()`, memoised per curve id) plus, only
+  /// when some supporting curve really does cross itself, one point-on-curve test per
+  /// (self-intersecting curve, other curve) pair.  The overwhelmingly common case — no curve in
+  /// the whole set self-intersects — costs one hash lookup per distinct supporting curve.
+  void check_sweepable(const std::vector<Geom>& curves) const override {
+    std::vector<Curve_2> distinct;                 // supporting curves, deduplicated by id()
+    std::unordered_set<std::size_t> seen;
+    for (const Geom& g : curves) {
+      if (g.type != GeomType::Curve && g.type != GeomType::XCurve) continue;
+      const Curve_2& C = (g.type == GeomType::XCurve) ? xcurve(g).supporting_curve() : curve(g);
+      if (seen.insert(C.id()).second) distinct.push_back(C);
+    }
+    std::vector<const Curve_2*> crossing;          // the ones that cross themselves (usually none)
+    for (const Curve_2& C : distinct) {
+      if (!self_intersection_points(C).empty()) {
+        reject_curve_cgal_calls_simple(C);
+        crossing.push_back(&C);
+      } else if (self_intersections_undecidable(C)) {
+        bad(ErrorCode::Unsupported,
+            "this curve is a straight motion along a line that reverses on itself, so it "
+            "overlaps its own image and no arrangement can represent it; CGAL 6.1 treats it as "
+            "simple (its control polygon is 'convex') and then either asserts "
+            "(org != p.originators_end(), Bezier_x_monotone_2.h:1008) or hangs forever");
+      }
+    }
+    if (crossing.empty()) return;
+    for (const Curve_2* A : crossing)
+      for (const Curve_2& B : distinct)
+        if (B.id() != A->id()) reject_meeting_at_self_intersection(*A, B);
+  }
+
+  /// `Curve_2::id()` is the address of the shared representation, and this TU retains every
+  /// Curve_2 rep for the life of the process (see the LIFETIME contract at the top), so the id
+  /// is a stable identity for as long as anything can compare it.  ArrImpl uses it to satisfy
+  /// the split_edge / merge_edge / modify_edge precondition ("the supplied x-monotone curves are
+  /// pieces of the edge curve they replace") in O(1): a piece of a supporting curve the
+  /// arrangement already holds introduces no new PAIR, hence nothing for check_sweepable() to
+  /// find.
+  std::uint64_t supporting_curve_id(const Geom& xc) const override {
+    return static_cast<std::uint64_t>(xcurve(xc).supporting_curve().id());
   }
 
  private:
+  /// Throws Unsupported when CGAL 6.1's own `has_no_self_intersections()` flag disagrees with the
+  /// exact answer.  `_Bezier_x_monotone_2::_exact_intersect` short-circuits on that flag for two
+  /// x-monotone pieces of the SAME supporting curve (Bezier_x_monotone_2.h:2120-2125), so the
+  /// sweep silently drops every crossing of such a curve — measured with the quartic
+  /// (-4,-4)(-3,4)(-3,-6)(1,3)(-4,-2): CGAL builds V=3 E=2 F=1 where the two crossings should be
+  /// vertices.  Refused rather than returned as a wrong arrangement; see
+  /// certainly-no-self-intersections above for why the flag is wrong.
+  void reject_curve_cgal_calls_simple(const Curve_2& C) const {
+    if (!C.has_no_self_intersections()) return;
+    bad(ErrorCode::Unsupported,
+        "this curve crosses itself, but CGAL 6.1's Curve_2::has_no_self_intersections() reports "
+        "it as simple (its angular-span test drops a control-polygon edge antipodal to "
+        "front->back, Bezier_bounding_rational_traits.h:859) and its sweep short-circuits on "
+        "that flag, so the arrangement would silently lose the self-intersection vertices");
+  }
+
+  /// Throws Unsupported when a self-intersection point of `A` lies anywhere on the supporting
+  /// curve `B` (see intersect() above).  The whole supporting curve matters, not just the
+  /// x-monotone sub-arc, because CGAL's pairing loop works on the supporting curves.
+  void reject_meeting_at_self_intersection(const Curve_2& A, const Curve_2& B) const {
+    const std::vector<Point_2>& pts = self_intersection_points(A);
+    if (pts.empty()) return;
+    std::vector<Make_x_monotone_result> pieces;
+    auto mx = traits().make_x_monotone_2_object();
+    mx(B, std::back_inserter(pieces));
+    auto in_range = adaptor().is_in_x_range_2_object();
+    auto cmp = adaptor().compare_y_at_x_2_object();
+    for (const Point_2& p : pts) {
+      for (const auto& item : pieces) {
+        const Xcv_2* piece = std::get_if<Xcv_2>(&item);
+        if (piece == nullptr) continue;
+        if (!in_range(*piece, p)) continue;
+        if (cmp(p, *piece) != CGAL::EQUAL) continue;
+        bad(ErrorCode::Unsupported,
+            "the two curves meet at a point where one of them crosses ITSELF; that point is "
+            "reached by three x-monotone branches at once and CGAL 6.1 can refine or exactly "
+            "evaluate a Bezier point with at most two (_Bezier_point_2_rep::_refine / "
+            "make_exact, Bezier_point_2.h:1421/1603)");
+      }
+    }
+  }
+
   double validated_tolerance(double tolerance) const {
     if (!(tolerance > 0.0) || !std::isfinite(tolerance))
       invalid("approximate: the tolerance must be a positive finite number");
@@ -952,8 +1319,15 @@ bool has_no_self_intersections(const Geom& c) {
   const Curve_2& B = (c.holds<Curve_2>() && c.type == GeomType::Curve)
                          ? c.as<Curve_2>()
                          : c.as<Xcv_2>().supporting_curve();
-  // Conservative: true means "certainly no self-intersections"; false means "maybe".
-  return B.has_no_self_intersections();
+  // EXACT, not conservative: `Curve_2::has_no_self_intersections()` answers "no
+  // self-intersections" for curves that do have them (see control_polygon_in_open_halfplane()
+  // above for the measured counter-example and the reason), so this goes through our own sound
+  // certificate and, when that is inconclusive, through the exact `id1 == id2` branch of the
+  // Bezier cache.  The exact branch is memoised per supporting curve; it is a resultant plus
+  // real-root isolation and costs microseconds for a cubic but tens of seconds for a
+  // high-degree wiggly curve — the same computation the arrangement pre-flight has to do
+  // anyway before such a curve can be inserted.
+  return self_intersection_points(B).empty() && !self_intersections_undecidable(B);
 }
 
 void point_originators(const Geom& p, std::vector<std::pair<std::size_t, double>>& out) {

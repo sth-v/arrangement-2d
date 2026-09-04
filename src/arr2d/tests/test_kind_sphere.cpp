@@ -936,14 +936,16 @@ int main() {
     check_eq_int(naive.type, 2, "naive locate((2,2,1)) -> a face");
     const Located dflt = arr->locate(inside, PL_DEFAULT);
     check(dflt.p == naive.p, "PL_DEFAULT agrees with naive");
-    const Located lm = arr->locate(inside, PL_LANDMARKS);
-    check(lm.p == naive.p, "landmarks agrees with naive");
     check(arr->supports_point_location(PL_NAIVE), "naive is supported");
-    check(arr->supports_point_location(PL_LANDMARKS), "landmarks is supported (uses Approximate_2)");
     // Arr_walk_along_line / Arr_simple need Topology_traits::initial_face(), which the spherical
     // topology traits does not have; Arr_trapezoid_ric compiles but aborts at construction;
     // Arr_triangulation needs a planar kernel point (traits_geodesic_sphere.md §10.9).
-    const int unsupported[] = {PL_SIMPLE, PL_WALK, PL_TRAPEZOID, PL_TRIANGULATION};
+    // Arr_landmarks COMPILES here but is unusable: its walk joins the nearest landmark to the
+    // query point with Construct_x_monotone_curve_2, whose CGAL 6.1 precondition
+    // `! equal_3(opposite(source), target)` (Arr_geodesic_arc_on_sphere_traits_2.h:611) forbids
+    // an ANTIPODAL pair and CGAL, not the caller, picks the landmark -- measured: locating the
+    // north pole of a two-octant arrangement raises it while every other strategy answers.
+    const int unsupported[] = {PL_SIMPLE, PL_WALK, PL_TRAPEZOID, PL_TRIANGULATION, PL_LANDMARKS};
     for (int s : unsupported) {
       check(!arr->supports_point_location(s),
             std::string("strategy '") + point_location_name(s) + "' is NOT supported");
@@ -952,15 +954,12 @@ int main() {
       expect_error(ErrorCode::Unsupported, [&] { arr->attach_point_location(s); },
                    std::string("attach '") + point_location_name(s) + "' -> Unsupported");
     }
-    // attached strategies
+    // attached strategies (naive is the only one the sphere offers)
     arr->attach_point_location(PL_NAIVE);
-    arr->attach_point_location(PL_LANDMARKS);
-    check(arr->has_point_location(PL_NAIVE) && arr->has_point_location(PL_LANDMARKS),
-          "naive and landmarks attach");
-    check(arr->locate(inside, PL_LANDMARKS).p == naive.p, "attached landmarks still agrees");
-    arr->detach_point_location(PL_LANDMARKS);
-    check(!arr->has_point_location(PL_LANDMARKS), "landmarks detaches");
+    check(arr->has_point_location(PL_NAIVE), "naive attaches");
+    check(arr->locate(inside, PL_NAIVE).p == naive.p, "attached naive still agrees");
     arr->detach_point_location(PL_NAIVE);
+    check(!arr->has_point_location(PL_NAIVE), "naive detaches");
 
     // locating a vertex and an edge
     const Located at_a = arr->locate(A, PL_NAIVE);

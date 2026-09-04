@@ -135,6 +135,37 @@ ext = Extension(
 )
 
 
+def _parallel_compile(compiler, jobs):
+    """Replace `compiler.compile` by a thread-pool version.
+
+    setuptools only parallelises ACROSS extensions, and this project has exactly one
+    (17 CGAL-heavy translation units).  Compiling them one by one takes ~20 min; the
+    pool below brings a cold build down to a few minutes.  Pure build-time change:
+    the compile commands themselves are untouched.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def compile(sources, output_dir=None, macros=None, include_dirs=None, debug=0,
+                extra_preargs=None, extra_postargs=None, depends=None):
+        macros, objects, extra_postargs, pp_opts, build = compiler._setup_compile(
+            output_dir, macros, include_dirs, sources, depends, extra_postargs)
+        cc_args = compiler._get_cc_args(pp_opts, debug, extra_preargs)
+
+        def _one(obj):
+            try:
+                src, ext = build[obj]
+            except KeyError:
+                return
+            compiler._compile(obj, src, ext, cc_args, extra_postargs, pp_opts)
+
+        with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            for _ in pool.map(_one, objects):   # re-raises the first failure
+                pass
+        return objects
+
+    compiler.compile = compile
+
+
 class build_ext(_build_ext):
     def finalize_options(self):
         super().finalize_options()
@@ -142,7 +173,10 @@ class build_ext(_build_ext):
             self.parallel = int(os.environ.get("ARR2D_JOBS", os.cpu_count() or 1))
 
     def build_extensions(self):
-        # Silence Python's own -DNDEBUG duplicates etc.; compiler-specific tweaks could go here.
+        try:
+            _parallel_compile(self.compiler, int(self.parallel or 1))
+        except Exception:      # never let a distutils-internal change break the build
+            pass
         super().build_extensions()
 
 

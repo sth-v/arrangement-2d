@@ -133,8 +133,11 @@ Geom box_sqrt_extension(const CGAL::Sqrt_extension<NT, NT, CGAL::Tag_true, FPTag
 /// NOT CGAL::to_double(Epeck::FT), which is interval-derived and wrong (gotcha #2).
 double to_double_correctly_rounded(const Rational& r);
 double to_double_correctly_rounded(const EpeckFT& x);
-/// Correctly rounded whenever the refinement loop converges (it always does for an irrational
-/// value); otherwise the midpoint of a certified 1-ulp enclosure.
+/// Always correctly rounded.  The refinement loop is unbounded except for a 2^20-bit safety
+/// ceiling and sizes every step from the MEASURED width of the enclosure relative to the value,
+/// so a value that is orders of magnitude smaller than its own terms (a + b*sqrt(c) with heavy
+/// cancellation) converges too; reaching the ceiling throws Error(Generic) rather than returning
+/// an uncertified double.
 double to_double_correctly_rounded(const SqrtExt& s);
 double to_double_correctly_rounded(const Algebraic& e);
 
@@ -142,7 +145,10 @@ double to_double_correctly_rounded(const Algebraic& e);
 /// (degenerate when the value is exactly a double).
 std::pair<double, double> interval_of(const Rational& r);
 std::pair<double, double> interval_of(const EpeckFT& x);
-std::pair<double, double> interval_of(const SqrtExt& s);
+/// `bits` = the requested precision of the first refinement step (never below 53); the loop then
+/// refines adaptively until the two bounds are the same double or two adjacent ones, or until the
+/// 2^20-bit ceiling is reached (the result is a sound enclosure either way).
+std::pair<double, double> interval_of(const SqrtExt& s, int bits = 53);
 /// `bits` = requested relative AND absolute precision handed to CORE::Expr::approx().
 /// CORE only ever refines, so repeated calls with growing `bits` yield nested intervals.
 std::pair<double, double> interval_of(const Algebraic& e, int bits = 53);
@@ -162,6 +168,10 @@ int compare(const SqrtExt& a, const SqrtExt& b);   ///< exact, even for differen
 int compare(const SqrtExt& a, const Rational& b);
 int compare(const Rational& a, const SqrtExt& b);
 int compare(const Algebraic& a, const Algebraic& b);
+/// Algebraic vs rational / sqrt-extension: decided with the CERTIFIED enclosure of the Expr, not
+/// with `CORE::Expr::cmp`, which can answer EQUAL for a rational strictly below an algebraic
+/// value (exact_coordinates_contract.md gotcha 1).  Equality is only reported when the enclosure
+/// cannot separate the two after 2^20 bits, i.e. it remains as undecidable as CORE makes it.
 int compare(const Algebraic& a, const Rational& b);
 int compare(const Rational& a, const Algebraic& b);
 int compare(const Algebraic& a, const SqrtExt& b);

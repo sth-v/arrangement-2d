@@ -83,6 +83,23 @@ installed by the Cython module at import (`arr2d::set_pyobject_hooks`). The core
 compiles without Python. Copying an arrangement copies (increfs) the data; overlay callbacks
 may set data on result elements.
 
+A reference owned by C++ is invisible to Python's cycle collector, so storing the *user's* object
+in the `PyRef` leaked every cycle that ran through element data: `face.data = {"arr": arr}` kept
+the whole arrangement alive for the life of the process and did not even appear in `gc.garbage`
+(the collector subtracts only the references its `tp_traverse` walk finds, and the C++ one always
+tipped the balance -- mirroring the object in a Python dict does not help either, because the
+mirror adds a reference *and* a visit).
+
+What the DCEL stores is therefore an opaque, unique **key** object (a bare `object()`), and the
+Cython `Arrangement` keeps `_data_refs: dict[key -> user object]`. The key is a GC root (its
+refcount exceeds the visits by exactly the C++ reference) but it references nothing, so it keeps
+nothing alive; the user object hangs off `_data_refs`, which the generated `tp_traverse` does
+visit, so a `.data` cycle is collected normally and the key then dies by refcounting when the DCEL
+is destroyed. `copy()` / `assign()` copy the KEYS (the `PyRef` copy increfs them) and the Cython
+layer re-maps them to the source's values; `clear()` empties the map; removed elements leave a
+stale entry behind, so the map is rebuilt from the live elements whenever it grows past twice the
+element count.
+
 ### Numbers
 
 * `arr2d::Rational` = `CGAL::Exact_rational` = `boost::multiprecision::mpq_rational` in this
@@ -183,7 +200,7 @@ a2.CircleSegment.circle(center, radius=None, squared_radius=None, orientation=CC
    .segment(p, q)
    aliases: a2.Circle(...), a2.CircularArc(...)
    .is_full .is_linear .is_circular .orientation .center .squared_radius .radius(float) .source .target
-a2.Polyline(points)  / Polyline.from_segments(segs)                                      kind POLYLINE
+a2.Polyline(points)  / Polyline.from_segments(segs) / Polyline.from_x_monotone_points(points)   kind POLYLINE
    .points -> [Point], .segments -> [Segment], len(), __getitem__
 a2.BezierCurve(control_points)                                                            kind BEZIER (polynomial)
    .control_points -> [Point], .degree, .evaluate(t) -> Point (rational t exact; float t approx)
@@ -194,7 +211,7 @@ a2.ConicArc.from_coefficients(r,s,t,u,v,w, orientation=None, source=None, target
    .ellipse(center, rx, ry, rotation=0(rational angle? no: give major/minor axis vectors), ...)
    .from_points(p1..p5)  .segment(p, q)  .from_rational_bezier(p0, p1, p2, w0, w1, w2)
    .coefficients -> 6 Fractions, .orientation, .is_full, .source, .target, .conic_type ("ellipse"/"parabola"/"hyperbola"/"segment"/...), .approximate_length()
-a2.GeodesicArc.from_points(p, q) / .from_points_and_normal(p, q, normal) / .great_circle(normal) / .meridian(...)   kind SPHERE
+a2.GeodesicArc.from_points(p, q) / .from_points_and_normal(p, q, normal) / .great_circle(normal) / .x_monotone_arc(p, q)   kind SPHERE
    .source .target .normal -> Point(kind=SPHERE) .is_full .is_vertical .is_meridian
 Common curve API: .kind, .is_x_monotone, .make_x_monotone() -> [curve|Point], .source/.target/.left/.right/.min/.max (x-monotone),
    .is_vertical, .is_directed_right, .bbox() -> (xmin,ymin,xmax,ymax) floats, .approximate(tolerance=1e-3, bbox=None) -> [(x,y)] (or (x,y,z)),
@@ -232,6 +249,13 @@ arr.locate(point, strategy=None) -> Vertex | Halfedge | Face
 arr.ray_shoot_up(point, strategy=None) / ray_shoot_down -> Vertex | Halfedge | Face | None
 arr.batched_locate(points) -> [result, ...] aligned with the input points
 arr.attach_point_location(strategy) / detach_point_location(strategy) ; strategies: "naive","simple","walk","landmarks","trapezoid","triangulation"
+#   not every kind offers every strategy -- ask arr.supports_point_location(name); "triangulation" is never
+#   offered, "landmarks" is not offered for circle_segment/bezier (no Construct_x_monotone_curve_2) nor for
+#   sphere (CGAL joins query point and landmark with an arc, which its own precondition forbids for an
+#   antipodal pair), "trapezoid" not for linear/sphere.  supports_point_location is an ARRANGEMENT
+#   question, not only a kind question: "landmarks" on the linear kind is offered exactly while the
+#   arrangement holds no unbounded edge (CGAL reads the null point of a vertex at infinity otherwise);
+#   inserting a ray/line turns it off (an attached structure is then no longer used), removing it back on
 arr.zone(curve) -> [Vertex | Halfedge | Face] ; arr.do_intersect(curve) -> bool
 arr.decompose() -> [(Vertex, below, above)]   (vertical decomposition; below/above are Vertex|Halfedge|Face|None)
 arr.overlay(other, on_vertex=None, on_edge=None, on_face=None, ...) -> Arrangement   (callbacks per OverlayTraits event; see Overlay below)
@@ -247,6 +271,9 @@ Vertex:   .point, .degree, .is_isolated, .face (isolated only), .incident_halfed
           .parameter_space_in_x/y, .data (get/set any Python object), .incident_faces()
 Halfedge: .source, .target, .twin, .next, .prev, .face, .curve (as stored), .directed_curve (oriented source->target), .direction ("left_to_right"/"right_to_left"),
           .is_fictitious, .is_on_inner_ccb, .ccb() -> [Halfedge] around its ccb, .data, .originating_curves() -> [CurveHandle], .edge_id (min of he/twin ids)
+          a FICTITIOUS halfedge carries no curve at all: .curve, .directed_curve, .originating_curves() and
+          .number_of_originating_curves all raise UnsupportedError for it
+          .face raises UnsupportedError inside an Observer's before_split_face(f, e), for e and e.twin
 Face:     .is_unbounded, .is_fictitious, .has_outer_ccb, .outer_ccb() -> [Halfedge] (planar; error if none), .outer_ccbs() -> [[Halfedge]] (sphere may have >1),
           .inner_ccbs() / .holes() -> [[Halfedge]], .isolated_vertices() -> [Vertex], .number_of_outer_ccbs/inner_ccbs/isolated_vertices, .data,
           .polygon(tolerance=None) -> PolygonWithHoles (exact curves) , .boundary_points(tolerance) -> approximated outer polyline + holes, .adjacent_faces(), .edges()
@@ -262,9 +289,29 @@ ps.oriented_side(point) -> -1/0/1 ; ps.locate(point) -> PolygonWithHoles|None ; 
 ps.to_arrangement() -> (Arrangement, [contained faces]) ; a2.PolygonSet.from_faces(faces) ; ps.copy()
 a2.orientation(polygon) ; a2.is_valid_polygon(polygon)
 
-# ---- high level (regions.py)
-a2.regions.bounded_faces(arr), a2.regions.merge_faces(arr, faces) (removes shared edges), a2.regions.union_outline(arr) -> PolygonSet,
-a2.regions.split_face(arr, face, curve), a2.regions.faces_polygons(arr, tolerance), a2.regions.face_containing(arr, point)
+# ---- high level (regions.py; lazily imported as a2.regions)
+a2.regions.bounded_faces(arr)                                  -> [Face]
+a2.regions.face_containing(arr, point, *, strategy=None, on_boundary="none"|"any"|"raise") -> Face | None
+a2.regions.face_area(face)                                     -> Fraction (rational kinds) | float
+a2.regions.faces_polygons(arr, tolerance, *, faces=None, include_unbounded=False) -> [FaceBoundary(face, outer, holes)]
+a2.regions.shared_edges(faces)                                 -> [Halfedge]   (edges between two distinct faces of the group)
+a2.regions.merge_faces(arr, faces, *, remove_vertices=True)    -> [Face]       (removes those edges, in place)
+a2.regions.split_face(arr, face, curve)                        -> [Face]       (zone-checked: the curve must stay in the face)
+a2.regions.connected_components(arr, *, include_vertices_at_infinity=False) -> [Component(vertices, edges)]
+a2.regions.number_of_connected_components(arr)                 -> int          (the C of V - E + F = 1 + C)
+a2.regions.extract_regions(arr, predicate=None, *, faces=None) -> [[Face]]     (selected faces grouped by adjacency)
+a2.regions.union_outline(arr, faces=None)                      -> PolygonSet   (exact; BSO kinds only)
+a2.regions.supports_boolean_ops(kind)                          -> bool
+
+# ---- plotting (plot.py; lazily imported as a2.plot; matplotlib imported inside the calls)
+a2.plot.plot_arrangement(arr, ax=None, *, tolerance, bbox, show_vertices, show_edges, faces,
+                         face_colors=None|"index"|"data"|colour|callable|mapping|sequence,
+                         face_alpha, edge_color, linewidth, vertex_color, vertex_size,
+                         projection, aspect, autoscale) -> Axes
+a2.plot.plot_polygon_set(polygons, ax=None, *, tolerance, bbox, face_color, face_alpha, edge_color,
+                         linewidth, aspect, autoscale) -> Axes
+a2.plot.plot_curves(curves, ax=None, *, tolerance, bbox, color, linewidth, projection, aspect, autoscale) -> Axes
+a2.plot.lonlat(x, y, z) -> (lon, lat)      a2.plot.has_matplotlib() -> bool
 ```
 
 ### Overlay callbacks

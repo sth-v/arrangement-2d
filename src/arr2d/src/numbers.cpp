@@ -373,21 +373,55 @@ double to_double_correctly_rounded(const Rational& r) {
 
 double to_double_correctly_rounded(const EpeckFT& x) { return to_double_correctly_rounded(to_rational(x)); }
 
+namespace {
+/// Hard ceiling of the refinement loops below.  `rational_sqrt_bounds` itself clamps `bits` to
+/// 2^20, so asking for more can never narrow the enclosure again — the loops must stop there.
+constexpr int kMaxRefineBits = 1 << 20;
+
+/// floor(log2(|r|)) +- 1 for r != 0 (msb of the numerator minus msb of the denominator).
+/// Only used to SIZE the next refinement step, never to decide anything.
+long approx_log2(const Rational& r) {
+  return msb_of(int_numerator(r)) - msb_of(int_denominator(r));
+}
+
+/// How many more bits the enclosure [lo, hi] needs before it is narrower than half an ulp of the
+/// value it encloses.  `sqrt_ext_bounds` has an ABSOLUTE error of |b| / (den(c) * 2^bits), so when
+/// the value is tiny compared to |b| / den(c) the requested `bits` must exceed 53 by exactly that
+/// ratio — the old fixed cap of 4096 bits silently returned a grossly wrong double instead
+/// (measured: 6.354056522299141 for a value of 0.6920959627877565).
+long extra_bits_needed(const Rational& lo, const Rational& hi) {
+  const Rational w = hi - lo;
+  if (w.sign() == 0) return 0;
+  const int slo = lo.sign(), shi = hi.sign();
+  if (slo * shi <= 0) return 64;   // the enclosure straddles 0: no magnitude information yet
+  const Rational m = (slo > 0) ? lo : Rational(-hi);   // min(|lo|, |hi|) > 0
+  const long need = approx_log2(w) - approx_log2(m) + 56;
+  return need < 64 ? 64 : need;
+}
+}  // namespace
+
 double to_double_correctly_rounded(const SqrtExt& s) {
   Rational v;
   if (sqrt_ext_is_rational(s, v)) return to_double_correctly_rounded(v);
-  // The value is irrational, so it is never a rounding tie: the loop converges.
-  for (int bits = 64; bits <= 4096; bits *= 2) {
-    Rational lo, hi;
-    sqrt_ext_bounds(s, bits, lo, hi);
+  // The value is irrational, so it is never a rounding tie: an enclosure narrow enough relative
+  // to the VALUE always pins one double down.  The step is sized from the measured width instead
+  // of doubling blindly, so a value that is many orders of magnitude smaller than its own terms
+  // still converges in two or three iterations.
+  long bits = 64;
+  Rational lo, hi;
+  while (true) {
+    sqrt_ext_bounds(s, static_cast<int>(bits), lo, hi);
     const double dl = to_double_correctly_rounded(lo);
     const double dh = to_double_correctly_rounded(hi);
     if (dl == dh) return dl;
+    if (bits >= kMaxRefineBits) break;
+    bits += extra_bits_needed(lo, hi);
+    if (bits > kMaxRefineBits) bits = kMaxRefineBits;
   }
-  Rational lo, hi;
-  sqrt_ext_bounds(s, 4096, lo, hi);
-  const Rational mid = (lo + hi) / 2;
-  return to_double_correctly_rounded(mid);
+  // Unreachable in practice (2^20 bits of absolute precision); never return an unqualified
+  // double that we could not certify.
+  throw_error(ErrorCode::Generic,
+              "a + b*sqrt(c) could not be rounded to a double after 2^20 bits of refinement");
 }
 
 namespace {
@@ -435,12 +469,30 @@ std::pair<double, double> interval_of(const Rational& r) {
 
 std::pair<double, double> interval_of(const EpeckFT& x) { return interval_of(to_rational(x)); }
 
-std::pair<double, double> interval_of(const SqrtExt& s) {
+std::pair<double, double> interval_of(const SqrtExt& s, int bits) {
   Rational v;
   if (sqrt_ext_is_rational(s, v)) return interval_of(v);
+  // A single pass at a HARD-CODED 128 bits used to be all this did, which is nowhere near "as
+  // tight as doubles allow": a circle-segment vertex whose x is 5e-41 came out as
+  // (0.0, 2.9e-39) — 59 times too wide and straddling zero, so the caller could not even read
+  // the sign off it — and in the extreme case the interval degenerated to (-inf, inf).  Refine
+  // adaptively, exactly like to_double_correctly_rounded(SqrtExt), until the two bounds are the
+  // same double or two adjacent doubles.
+  long b = bits <= 0 ? 53 : bits;
+  if (b < 53) b = 53;
   Rational lo, hi;
-  sqrt_ext_bounds(s, 128, lo, hi);
-  return {interval_of(lo).first, interval_of(hi).second};
+  std::pair<double, double> out{0.0, 0.0};
+  while (true) {
+    sqrt_ext_bounds(s, static_cast<int>(b), lo, hi);
+    out = {interval_of(lo).first, interval_of(hi).second};
+    if (out.first == out.second) return out;
+    if (!std::isinf(out.first) && !std::isinf(out.second) &&
+        std::nextafter(out.first, std::numeric_limits<double>::infinity()) == out.second)
+      return out;
+    if (b >= kMaxRefineBits) return out;   // best certified effort; still a sound enclosure
+    b += extra_bits_needed(lo, hi);
+    if (b > kMaxRefineBits) b = kMaxRefineBits;
+  }
 }
 
 std::pair<double, double> interval_of(const Algebraic& e, int bits) {
@@ -473,9 +525,43 @@ int compare(const Algebraic& a, const Algebraic& b) {
   const int c = a.cmp(b);
   return (c < 0) ? -1 : (c > 0 ? 1 : 0);
 }
-int compare(const Algebraic& a, const Rational& b) { return compare(a, to_core_expr(b)); }
+// CGAL_TRAPS_CHECKLIST "Numbers / coordinates" / exact_coordinates_contract.md gotcha 1:
+// `CORE::Expr::cmp` against a RATIONAL can return a wrong answer.  Measured on the conic
+// arrangement of x^2 + y^2 = 2 with y = 0: for the vertex coordinate X = sqrt(2) and the
+// convergent r = p/q with p^2 - 2q^2 = -1 (so r < sqrt(2) strictly, provable in pure rational
+// arithmetic) CORE reports X == r and X > r == false — both wrong, and the pair
+// (X == r, X == sqrt(2)) even breaks transitivity.  The certified enclosure below decides the
+// same case correctly at a few hundred bits, so never ask CORE.  `Expr::cmp` is only reached when
+// the enclosure still straddles `b` after 2^20 bits, i.e. when the two values really are equal
+// (CORE has no exact rationality test, so we cannot prove that ourselves — documented in
+// numbers.hpp and in the Algebraic docstring).
+int compare(const Algebraic& a, const Rational& b) {
+  Rational lo, hi;
+  for (long bits = 64; ; ) {
+    expr_enclosure(a, static_cast<int>(bits), lo, hi);
+    if (rational_compare(lo, b) > 0) return 1;
+    if (rational_compare(hi, b) < 0) return -1;
+    if (lo == hi) return rational_compare(lo, b);   // the enclosure is exact
+    if (bits >= kMaxRefineBits) break;
+    bits *= 2;
+    if (bits > kMaxRefineBits) bits = kMaxRefineBits;
+  }
+  return compare(a, to_core_expr(b));
+}
 int compare(const Rational& a, const Algebraic& b) { return -compare(b, a); }
-int compare(const Algebraic& a, const SqrtExt& b) { return compare(a, to_core_expr(b)); }
+int compare(const Algebraic& a, const SqrtExt& b) {
+  Rational lo, hi;
+  for (long bits = 64; ; ) {
+    expr_enclosure(a, static_cast<int>(bits), lo, hi);
+    if (compare(b, lo) < 0) return 1;               // b < lo <= a
+    if (compare(b, hi) > 0) return -1;              // a <= hi < b
+    if (lo == hi) return -compare(b, lo);
+    if (bits >= kMaxRefineBits) break;
+    bits *= 2;
+    if (bits > kMaxRefineBits) bits = kMaxRefineBits;
+  }
+  return compare(a, to_core_expr(b));
+}
 int compare(const SqrtExt& a, const Algebraic& b) { return -compare(b, a); }
 
 // ===========================================================================
@@ -501,7 +587,7 @@ double number_to_double(const Geom& n) {
 std::pair<double, double> number_interval(const Geom& n, int bits) {
   switch (number_kind(n)) {
     case NumberKind::Rational: return interval_of(n.as<Rational>());
-    case NumberKind::SqrtExt: return interval_of(n.as<SqrtExt>());
+    case NumberKind::SqrtExt: return interval_of(n.as<SqrtExt>(), bits);
     default: return interval_of(n.as<Algebraic>(), bits);
   }
 }
@@ -565,14 +651,16 @@ int number_compare(const Geom& a, const Geom& b) {
     return compare(a.as<SqrtExt>(), b.as<Rational>());
   if (ka == NumberKind::Rational && kb == NumberKind::SqrtExt)
     return compare(a.as<Rational>(), b.as<SqrtExt>());
-  // Anything mixed with an Algebraic: lift both to CORE::Expr (exact).
-  const Algebraic ea = (ka == NumberKind::Algebraic) ? a.as<Algebraic>()
-                       : (ka == NumberKind::Rational) ? to_core_expr(a.as<Rational>())
-                                                      : to_core_expr(a.as<SqrtExt>());
-  const Algebraic eb = (kb == NumberKind::Algebraic) ? b.as<Algebraic>()
-                       : (kb == NumberKind::Rational) ? to_core_expr(b.as<Rational>())
-                                                      : to_core_expr(b.as<SqrtExt>());
-  return compare(ea, eb);
+  // Anything mixed with an Algebraic goes through the certified-enclosure comparisons above:
+  // lifting the rational / sqrt-extension side into a CORE::Expr and calling Expr::cmp is exactly
+  // the operation CGAL_TRAPS_CHECKLIST forbids ("never build logic on `Expr == rational`").
+  if (ka == NumberKind::Algebraic && kb == NumberKind::Rational)
+    return compare(a.as<Algebraic>(), b.as<Rational>());
+  if (ka == NumberKind::Rational && kb == NumberKind::Algebraic)
+    return compare(a.as<Rational>(), b.as<Algebraic>());
+  if (ka == NumberKind::Algebraic && kb == NumberKind::SqrtExt)
+    return compare(a.as<Algebraic>(), b.as<SqrtExt>());
+  return compare(a.as<SqrtExt>(), b.as<Algebraic>());
 }
 
 std::string number_repr(const Geom& n) {

@@ -237,11 +237,22 @@ class ArrBase {
   virtual FH remove_edge(HH h, bool remove_source, bool remove_target) = 0;   ///< CGAL::remove_edge semantics: returns the face containing the removed edge; optionally removes end vertices that become isolated/redundant
 
   // ---- with-history operations & global insertion functions --------------
+  // UNBOUNDED kinds only (Linear): inserting an unbounded curve whose OVERLAP with an existing
+  // edge is itself unbounded makes CGAL 6.1 abort -- `cv.has_left()` (Arr_linear_traits_2.h:689)
+  // on the incremental path, `! e->is_fictitious()` (Arrangement_on_surface_2_impl.h:1517) on the
+  // aggregate one.  All three entry points detect that overlap first and throw
+  // Error(Unsupported, "CGAL 6.1 cannot insert an unbounded curve overlapping an existing edge");
+  // the arrangement is left untouched.  An overlap bounded at both ends is inserted normally
+  // (and the aggregate path additionally refuses one that is unbounded only on the right).
   virtual CH insert_curve(const Geom& c) = 0;                            ///< CGAL::insert(arr, curve): general curve, recorded in history
   virtual void insert_curves(const std::vector<Geom>& cs, std::vector<CH>& out) = 0;   ///< aggregate (sweep-line) insertion, recorded in history
   virtual HH insert_non_intersecting_curve(const Geom& xc) = 0;         ///< no history (Precondition error if it intersects the arrangement interior)
   virtual void insert_non_intersecting_curves(const std::vector<Geom>& xcs) = 0;
   virtual VH insert_point(const Geom& p) = 0;                            ///< CGAL::insert_point
+  /// SPHERE kind: removing a vertex on a pole or on the identification curve leaves the spherical
+  /// topology traits with dangling pointers (the next insertion segfaults), so remove_vertex and
+  /// remove_isolated_vertex throw Error(Unsupported) for a vertex whose parameter space is not
+  /// ARR_INTERIOR in x and y.
   virtual bool remove_vertex(VH v) = 0;                                  ///< CGAL::remove_vertex: isolated vertices, or degree-2 vertices whose edges can be merged
   virtual std::size_t remove_curve(CH c) = 0;                            ///< remove an input curve and all edges it induces (edges also induced by other curves are kept); returns #removed edges
   virtual HH split_edge_at_point(HH h, const Geom& p) = 0;               ///< with-history split_edge(e, p): keeps history consistent
@@ -261,14 +272,27 @@ class ArrBase {
   /// (simple, walk, trapezoid); PL_DEFAULT picks a supporting one.
   virtual Located ray_shoot_up(const Geom& p, int strategy = PL_DEFAULT) const = 0;
   virtual Located ray_shoot_down(const Geom& p, int strategy = PL_DEFAULT) const = 0;
-  virtual void batched_locate(const std::vector<Geom>& pts, std::vector<Located>& out) const = 0;   ///< out[i] corresponds to pts[i] (CGAL returns xy-sorted results; the impl restores input order)
+  /// out[i] corresponds to pts[i] (CGAL returns xy-sorted results; the impl restores input order).
+  /// SPHERE kind: a query point on a pole or on the identification curve is answered individually
+  /// with the naive strategy, because CGAL's batched sweep dereferences a null halfedge at the
+  /// north pole and violates Compare_x_2's `is_no_boundary()` precondition elsewhere on the
+  /// boundary.  Every result is still returned in input order.
+  virtual void batched_locate(const std::vector<Geom>& pts, std::vector<Located>& out) const = 0;
   virtual bool supports_point_location(int strategy) const = 0;
   virtual void attach_point_location(int strategy) = 0;             ///< build & keep a strategy object (observer-updated where CGAL supports it); Unsupported if !supports_point_location
   virtual void detach_point_location(int strategy) = 0;
   virtual bool has_point_location(int strategy) const = 0;
-  virtual void zone(const Geom& c, std::vector<Located>& out) = 0;   ///< CGAL::zone of an x-monotone curve (features in order along the curve); a general Curve is subdivided first
-  virtual bool do_intersect(const Geom& c) = 0;
-  virtual void decompose(std::vector<VerticalDecompositionEntry>& out) const = 0;   ///< CGAL::decompose (vertical decomposition), vertices in xy-lexicographic order
+  /// CGAL::zone of an x-monotone curve (features in order along the curve); a general Curve is
+  /// subdivided first.  BEZIER kind: when the query curve OVERLAPS an existing edge, CGAL 6.1's
+  /// Arrangement_zone_2 does std::get<X_monotone_curve_2> on a variant that holds an intersection
+  /// point (Arrangement_zone_2_impl.h:214); the resulting std::bad_variant_access is caught and
+  /// reported as Error(Unsupported) instead of escaping as an unrelated runtime error.
+  virtual void zone(const Geom& c, std::vector<Located>& out) = 0;
+  virtual bool do_intersect(const Geom& c) = 0;        ///< same CGAL 6.1 Bezier restriction as zone()
+  /// CGAL::decompose (vertical decomposition), vertices in xy-lexicographic order.
+  /// SPHERE kind: throws Error(Unsupported) when ANY vertex lies on a pole or on the
+  /// identification curve (CGAL's sweep asserts `p1.is_no_boundary()` there).
+  virtual void decompose(std::vector<VerticalDecompositionEntry>& out) const = 0;
 
   // ---- observers ---------------------------------------------------------
   virtual int add_observer(void* user, ObserverFn fn) = 0;    ///< returns a token

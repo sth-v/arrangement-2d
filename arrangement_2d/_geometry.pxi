@@ -17,7 +17,6 @@
 #     We only raise Python errors for things the core cannot see (wrong Python types,
 #     wrong tuple lengths, mutually exclusive keyword arguments, ...).
 
-import math as _math
 from fractions import Fraction as _Fraction
 
 
@@ -214,6 +213,22 @@ cdef Geom _as_point(object obj, Kind kind) except *:
     if dim == 3:
         return ops(kind).make_point_3(c[0], c[1], c[2])
     return ops(kind).make_point(c[0], c[1])
+
+
+cdef Geom _as_conic_rational_point(object obj) except *:
+    """A point for a conic constructor that requires EXACT RATIONAL coordinates.
+
+    ``conic::make_from_five_points`` / ``make_from_rational_bezier`` and the fast path of
+    ``make_segment`` refuse a Conic-kind point: a ``Conic_point_2`` stores CORE::Expr
+    coordinates and CORE has no sound rationality test
+    (docs/dev/cgal61_api/exact_coordinates_contract.md gotcha 1).  A plain coordinate pair
+    is therefore boxed as a SEGMENT-kind (exact rational) point; an explicit
+    :class:`Point` is passed through with its own kind, so a conic point still reaches the
+    core and gets the core's own ``NotRepresentableError``.
+    """
+    if isinstance(obj, Point):
+        return (<Point>obj).g
+    return _as_point(obj, _K_SEGMENT)
 
 
 cdef Geom _as_curve(object obj, Kind kind, bint x_monotone) except *:
@@ -522,6 +537,14 @@ cdef class Point:
         return not r
 
     def __hash__(self):
+        """Hash of the exact coordinates.
+
+        A sphere point stores an UNNORMALISED direction while ``__eq__`` (the traits'
+        ``Equal_2``) is projective -- two directions are equal iff they are positive
+        multiples -- so the components are divided by the largest absolute one before
+        hashing.  Dividing by a POSITIVE factor keeps the sign pattern, so antipodal
+        directions still hash differently.  Planar kinds hash their coordinates as stored.
+        """
         cdef vector[Rational] rs
         cdef size_t i
         if not ops(self.g.kind).point_is_rational(self.g):
@@ -529,7 +552,12 @@ cdef class Point:
                             "point of kind '%s' has irrational coordinates"
                             % (kind_name(self.g.kind),))
         ops(self.g.kind).point_exact_rational(self.g, rs)
-        return hash(tuple([_fraction(rs[i]) for i in range(rs.size())]))
+        vals = [_fraction(rs[i]) for i in range(rs.size())]
+        if ops(self.g.kind).dimension() == 3 and vals:
+            m = max([abs(v) for v in vals])
+            if m:
+                vals = [v / m for v in vals]
+        return hash(tuple(vals))
 
     def __len__(self):
         return ops(self.g.kind).dimension()
@@ -819,9 +847,19 @@ cdef class Curve:
 
     # ---------------------------------------------------------------- protocol
     def __eq__(self, other):
+        """Geometric equality (traits ``Equal_2``).
+
+        A curve that needs more than one x-monotone piece (a self-intersecting Bezier
+        curve, a full circle, a multi-piece conic arc) has no single
+        ``X_monotone_curve_2`` to hand to ``Equal_2``; those are compared piecewise on
+        their ``Make_x_monotone_2`` decompositions, which come out in parametric order.
+        """
         cdef Curve o
         cdef Geom a
         cdef Geom b
+        cdef vector[Geom] pa
+        cdef vector[Geom] pb
+        cdef size_t i
         if not isinstance(other, Curve):
             return NotImplemented
         o = <Curve>other
@@ -831,7 +869,19 @@ cdef class Curve:
             a = _xg(self)
             b = _xg(o)
         except NotXMonotoneError:
-            return NotImplemented
+            ops(self.g.kind).make_x_monotone(self.g, pa)
+            ops(o.g.kind).make_x_monotone(o.g, pb)
+            if pa.size() != pb.size():
+                return False
+            for i in range(pa.size()):
+                if <int>pa[i].type != <int>pb[i].type:
+                    return False
+                if <int>pa[i].type == _GT_POINT:
+                    if not ops(self.g.kind).point_equal(pa[i], pb[i]):
+                        return False
+                elif not ops(self.g.kind).curve_equal(pa[i], pb[i]):
+                    return False
+            return True
         return ops(self.g.kind).curve_equal(a, b)
 
     def __ne__(self, other):
@@ -1117,10 +1167,22 @@ cdef class CircleSegment(Curve):
 
     @property
     def radius(self):
-        """The radius: a ``Fraction`` when :attr:`has_rational_radius`, else a float."""
+        """The radius: a ``Fraction`` when :attr:`has_rational_radius`, else a float.
+
+        The float is the **correctly rounded** double nearest to the exact
+        ``sqrt(squared_radius)``; it is computed from the exact rational squared radius, not
+        by ``math.sqrt`` of its double approximation (that double rounding was wrong by one
+        ulp for 12 % of random rational squared radii).
+        """
+        cdef SqrtExt s
         if cs_has_rational_radius(self.g):
             return _fraction(cs_radius(self.g))
-        return _math.sqrt(rational_to_double(cs_squared_radius(self.g)))
+        # radius == 0 + 1*sqrt(r2), which number_to_double() rounds correctly (and which
+        # box_sqrt_ext() normalises back to a Rational when r2 is a perfect square).
+        s.a = rational_from_int64(<int64_t>0)
+        s.b = rational_from_int64(<int64_t>1)
+        s.c = cs_squared_radius(self.g)
+        return number_to_double(box_sqrt_ext(s))
 
     @property
     def supporting_line(self):
@@ -1178,8 +1240,14 @@ cdef class Polyline(Curve):
         return _wrap_curve(polyline_make_from_segments(segs))
 
     @classmethod
-    def x_monotone(cls, points):
-        """An x-monotone polyline; the points must already form an x-monotone chain."""
+    def from_x_monotone_points(cls, points):
+        """An x-monotone polyline; the points must already form an x-monotone chain.
+
+        Named ``from_x_monotone_points`` rather than ``x_monotone`` because a cdef class
+        shares one namespace for class and instance attributes: a classmethod called
+        ``x_monotone`` would shadow the inherited instance method
+        :meth:`Curve.x_monotone` for every :class:`Polyline` object.
+        """
         cdef vector[Geom] pts
         for it in points:
             pts.push_back(_as_point(it, _K_POLYLINE))
@@ -1277,12 +1345,16 @@ cdef class BezierCurve(Curve):
         if n == 2:
             # A rational linear Bezier is the segment p0..p1 (the weights only
             # reparametrise it), so the exact conic representation is that segment.
-            return _wrap_curve(conic_make_segment(_as_point(pts[0], _K_CONIC),
-                                                  _as_point(pts[1], _K_CONIC)))
+            # _as_conic_rational_point, NOT _as_point(..., _K_CONIC): the conic core requires
+            # EXACT RATIONAL control points and refuses a Conic_point_2 (CORE::Expr has no sound
+            # rationality test).  This is byte-for-byte what ConicArc.segment /
+            # .from_rational_bezier do, so the two spellings of the construction agree.
+            return _wrap_curve(conic_make_segment(_as_conic_rational_point(pts[0]),
+                                                  _as_conic_rational_point(pts[1])))
         if n == 3:
             return _wrap_curve(conic_make_from_rational_bezier(
-                _as_point(pts[0], _K_CONIC), _as_point(pts[1], _K_CONIC),
-                _as_point(pts[2], _K_CONIC),
+                _as_conic_rational_point(pts[0]), _as_conic_rational_point(pts[1]),
+                _as_conic_rational_point(pts[2]),
                 _to_rational(ws[0]), _to_rational(ws[1]), _to_rational(ws[2])))
         raise NotRepresentableError(
             "rational Bezier curves of degree %d are not exactly representable: CGAL 6.1 "
@@ -1333,7 +1405,16 @@ cdef class BezierCurve(Curve):
 
     @property
     def has_self_intersections(self):
-        """True when the supporting curve intersects itself."""
+        """True when the supporting curve intersects (or overlaps) itself.
+
+        Exact, not conservative.  CGAL 6.1's own ``Curve_2::has_no_self_intersections()``
+        answers "simple" for some curves that are not -- its angular-span test drops any
+        control-polygon edge antipodal to ``front -> back`` -- so this goes through a sound
+        control-polygon certificate first and falls back to the exact resultant computation
+        of the Bezier cache.  That fallback is memoised per supporting curve; it costs
+        microseconds for a cubic and can cost tens of seconds for a high-degree wiggly
+        curve (the same computation inserting the curve into an arrangement has to do).
+        """
         return not bezier_has_no_self_intersections(self.g)
 
     def evaluate(self, t):
@@ -1468,21 +1549,26 @@ cdef class ConicArc(Curve):
     @classmethod
     def segment(cls, p, q):
         """A straight line segment as a (degenerate) conic arc."""
-        return _wrap_curve(conic_make_segment(_as_point(p, _K_CONIC),
-                                              _as_point(q, _K_CONIC)))
+        # Rational endpoints go in as SEGMENT-kind points so that the core can take the exact
+        # Rat_segment_2 overload (which fills in the supporting-line coefficients); a Conic
+        # point is passed through and handled by the "special segment" fallback.
+        return _wrap_curve(conic_make_segment(_as_conic_rational_point(p),
+                                              _as_conic_rational_point(q)))
 
     @classmethod
     def from_points(cls, p1, p2, p3, p4, p5):
         """The conic arc through five rational points (``p1`` source, ``p5`` target)."""
         return _wrap_curve(conic_make_from_five_points(
-            _as_point(p1, _K_CONIC), _as_point(p2, _K_CONIC), _as_point(p3, _K_CONIC),
-            _as_point(p4, _K_CONIC), _as_point(p5, _K_CONIC)))
+            _as_conic_rational_point(p1), _as_conic_rational_point(p2),
+            _as_conic_rational_point(p3), _as_conic_rational_point(p4),
+            _as_conic_rational_point(p5)))
 
     @classmethod
     def from_rational_bezier(cls, p0, p1, p2, w0=1, w1=1, w2=1):
         """The exact conic arc of a rational quadratic Bezier curve."""
         return _wrap_curve(conic_make_from_rational_bezier(
-            _as_point(p0, _K_CONIC), _as_point(p1, _K_CONIC), _as_point(p2, _K_CONIC),
+            _as_conic_rational_point(p0), _as_conic_rational_point(p1),
+            _as_conic_rational_point(p2),
             _to_rational(w0), _to_rational(w1), _to_rational(w2)))
 
     @classmethod
@@ -1598,7 +1684,7 @@ cdef class GeodesicArc(Curve):
     def __init__(self, *args, **kwargs):
         raise TypeError("GeodesicArc has no public constructor; use "
                         "GeodesicArc.from_points(p, q), .from_points_and_normal(p, q, n), "
-                        ".great_circle(normal) or .x_monotone(p, q)")
+                        ".great_circle(normal) or .x_monotone_arc(p, q)")
 
     @classmethod
     def from_points(cls, p, q):
@@ -1622,8 +1708,13 @@ cdef class GeodesicArc(Curve):
         return _wrap_curve(sphere_make_full_circle(_as_point(normal, _K_SPHERE)))
 
     @classmethod
-    def x_monotone(cls, p, q):
-        """The x-monotone arc from `p` to `q` (a CGAL precondition if it is not)."""
+    def x_monotone_arc(cls, p, q):
+        """The x-monotone arc from `p` to `q` (a CGAL precondition if it is not).
+
+        Named ``x_monotone_arc`` rather than ``x_monotone`` so that the inherited instance
+        method :meth:`Curve.x_monotone` stays reachable (a cdef class shares one namespace
+        for class and instance attributes).
+        """
         return _wrap_curve(sphere_make_x_monotone_arc(_as_point(p, _K_SPHERE),
                                                       _as_point(q, _K_SPHERE)))
 
@@ -1663,7 +1754,11 @@ cdef Geom _make_straight(const Geom& p, const Geom& q, Kind k) except *:
     if <int>k == <int>_K_CIRCLE_SEGMENT:
         # Arr_circle_segment_traits_2 has no Construct_x_monotone_curve_2 at all
         # (traits_circle_segment gotcha 3) -> use the kind's own segment constructor.
-        return cs_make_segment(p, q)
+        # circle_segment::make_segment boxes a GENERAL Curve_2, but a polygon boundary needs
+        # the X_monotone_curve_2 box every other kind returns here; a straight
+        # circle-segment curve is always exactly one x-monotone piece, so the promotion
+        # cannot split (and to_x_monotone raises NotXMonotoneError if it ever did).
+        return ops(k).to_x_monotone(cs_make_segment(p, q))
     if <int>k == <int>_K_BEZIER:
         raise UnsupportedError(
             "kind 'bezier' cannot build a polygon from points: the Bezier traits has no "
@@ -1771,6 +1866,54 @@ cdef vector[Geom] _ring_geoms(Polygon p, Kind kind) except *:
     return out
 
 
+cdef object _polygon_exact_signed_area(Polygon p):
+    """The EXACT signed area of a closed polygon as a ``Fraction``, or ``None``.
+
+    Available for the three kinds whose vertices are always exactly rational -- ``segment``,
+    ``linear`` and ``polyline`` (all three store Epeck points).  ``None`` means "compute it
+    from ``approximate()`` instead": an open chain, another kind, or (defensively) a vertex
+    that turns out not to be rational.
+
+    This is what makes ``orientation()`` and ``area()`` right for slivers: the double
+    shoelace of ``approximate(1e-3)`` rounds the vertices first, so the sign collapses (or
+    flips) for a triangle such as (0,0), (1,1), (2, 2 + 1e-40) whose exact signed area is
+    5e-41 -- and ``orientation()`` is the documented precondition of Boolean-set insertion.
+    """
+    cdef Py_ssize_t n, i, j
+    cdef list ring = []
+    cdef list pts
+    cdef object src
+    cdef int kk = <int>p._kind
+    if kk != <int>_K_SEGMENT and kk != <int>_K_LINEAR and kk != <int>_K_POLYLINE:
+        return None
+    if not p.is_closed:
+        return None
+    try:
+        for c in p._curves:
+            if <int>p._kind == <int>_K_POLYLINE:
+                # A polyline curve carries interior vertices that Polygon.points does not
+                # report; they contribute to the area, so walk the curve's own vertex list.
+                pts = [q.exact_rational() for q in (<Curve>c).points]
+                src = _wrap_point(ops(p._kind).xcurve_source((<Curve>c).g)).exact_rational()
+                if pts[0] != src:
+                    pts.reverse()             # the polycurve is stored right-to-left
+                del pts[len(pts) - 1]         # shared with the next curve's first vertex
+                ring.extend(pts)
+            else:
+                ring.append(_wrap_point(
+                    ops(p._kind).xcurve_source((<Curve>c).g)).exact_rational())
+    except (NotRepresentableError, UnsupportedError):
+        return None
+    n = len(ring)
+    if n < 3:
+        return None
+    acc = _Fraction(0)
+    for i in range(n):
+        j = (i + 1) % n
+        acc = acc + (ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1])
+    return acc / 2
+
+
 cdef double _signed_area_2d(list pts):
     cdef Py_ssize_t n = len(pts)
     cdef Py_ssize_t i, j
@@ -1872,8 +2015,10 @@ cdef class Polygon:
         """+1 for a counterclockwise boundary, -1 for clockwise, 0 when undecidable.
 
         Exact for the kinds that have Boolean set operations (segment, circle_segment,
-        conic, bezier); for the others it is the sign of the signed area of
-        ``approximate(1e-3)``.
+        conic, bezier -- CGAL's ``Gps_traits_adaptor::Orientation_2``) and, for a closed
+        chain, for the two remaining rational-vertex kinds (linear, polyline -- an exact
+        ``Fraction`` shoelace).  Only an open chain, or a kind whose vertices may be
+        irrational, falls back to the sign of the signed area of ``approximate(1e-3)``.
         """
         cdef vector[Geom] ring
         cdef PolygonSet ps
@@ -1882,6 +2027,13 @@ cdef class Polygon:
             ps = _polygon_set_for_kind(self._kind)
             ring = _ring_geoms(self, self._kind)
             return ps.ps.get().orientation(ring)
+        exact = _polygon_exact_signed_area(self)
+        if exact is not None:
+            if exact > 0:
+                return 1
+            if exact < 0:
+                return -1
+            return 0
         a = _signed_area_2d(self.approximate(1e-3))
         if a > 0.0:
             return 1
@@ -1945,28 +2097,16 @@ cdef class Polygon:
     def area(self):
         """The **signed** area (positive for a counterclockwise boundary).
 
-        Exact (a ``Fraction``) for the ``SEGMENT`` kind, an approximate ``float`` computed
-        from ``approximate(1e-3)`` for every other kind.
+        Exact (a ``Fraction``) for a closed polygon of one of the three rational-vertex
+        kinds -- ``SEGMENT``, ``LINEAR`` and ``POLYLINE`` (a polyline's interior vertices are
+        included, unlike in :attr:`points`).  Every other case is an approximate ``float``
+        computed from ``approximate(1e-3)``, because the boundary is curved.
         """
-        cdef Py_ssize_t n, i, j
-        cdef list xs
-        cdef list ys
-        if <int>self._kind == <int>_K_SEGMENT:
-            if not self.is_closed:
-                raise ValueError("area() needs a closed polygon")
-            pts = self.points
-            n = len(pts)
-            xs = []
-            ys = []
-            for p in pts:
-                ex = p.exact_rational()
-                xs.append(ex[0])
-                ys.append(ex[1])
-            acc = _Fraction(0)
-            for i in range(n):
-                j = (i + 1) % n
-                acc = acc + (xs[i] * ys[j] - xs[j] * ys[i])
-            return acc / 2
+        if <int>self._kind == <int>_K_SEGMENT and not self.is_closed:
+            raise ValueError("area() needs a closed polygon")
+        exact = _polygon_exact_signed_area(self)
+        if exact is not None:
+            return exact
         return _signed_area_2d(self.approximate(1e-3))
 
     def is_simple(self):

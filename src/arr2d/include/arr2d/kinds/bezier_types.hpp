@@ -1,6 +1,13 @@
 #pragma once
 #include <CGAL/CORE_algebraic_number_traits.h>
 #include <CGAL/Cartesian.h>
+// MUST come before <CGAL/Arr_Bezier_curve_traits_2.h>: it defines an explicit specialization of
+// _Bezier_cache<CORE_algebraic_number_traits>::get_intersections (CGAL 6.1 pairs the two curves'
+// resultant roots assuming a bijection and reads out of bounds when one curve passes through the
+// other's self-intersection point), and [temp.expl.spec]/6 requires the specialization to be
+// declared before anything can implicitly instantiate the member.  This header is the ONLY place
+// in the project that includes the Bezier traits, which is what makes that orderable at all.
+#include "arr2d/impl/bezier_cache_fix.hpp"
 #include <CGAL/Arr_Bezier_curve_traits_2.h>
 #include <CGAL/Arr_extended_dcel.h>
 #include <CGAL/Arrangement_with_history_2.h>

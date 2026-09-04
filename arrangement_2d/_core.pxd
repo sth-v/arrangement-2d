@@ -559,6 +559,11 @@ cdef class Arrangement:
     cdef Kind _kind
     cdef object _observers          # dict token -> Python observer
     cdef object _pending            # pending exception info from callbacks (or None)
+    # Mirror of every Python object currently stored in a DCEL element's `.data`, keyed by
+    # (pointer, id).  The C++ core owns those references through arr2d::PyRef, which Python's
+    # cycle collector cannot see; this dict IS visited by the generated tp_traverse, so a cycle
+    # running through element data (`face.data = {"arr": arr}`) becomes collectable.
+    cdef dict _data_refs
     cdef object __weakref__
 
 cdef class Vertex:

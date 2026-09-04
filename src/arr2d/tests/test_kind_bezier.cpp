@@ -640,7 +640,8 @@ static void test_traits_functors() {
 
   // THE TRAP (exact_coordinates_contract.md gotcha 5 / CGAL_TRAPS_CHECKLIST "Bezier kind"):
   // CGAL's Split_2 silently accepts a rational point that is nowhere near the curve.
-  // BezierOps::split() must reject it.
+  // KindOpsBase::split() must reject it (it validates the split point for EVERY kind now,
+  // because the geodesic Split_2 has the same hole; this used to be a BezierOps override).
   CHECK_ERR(ErrorCode::InvalidArgument,
             { Geom l, r; K.split(piece0, K.make_point(R(1000), R(1000)), l, r); });
   // a point in the x-range but off the curve
