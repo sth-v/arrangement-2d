@@ -157,7 +157,7 @@ cdef extern from "arr2d/ops.hpp" namespace "arr2d":
     cdef cppclass IntersectionResult:
         cbool is_point
         Geom point
-        unsigned multiplicity
+        size_t multiplicity
         Geom overlap
 
     cdef cppclass BBox:

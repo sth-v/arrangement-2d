@@ -176,9 +176,9 @@ cdef SqrtExtension _wrap_sqrt_ext(const Geom& n):
     cdef SqrtExt s = number_to_sqrt_ext(n)
     cdef SqrtExtension out = SqrtExtension.__new__(SqrtExtension)
     out.g = n
-    out.a = _fraction(s.a)
-    out.b = _fraction(s.b)
-    out.c = _fraction(s.c)
+    out._a = _fraction(s.a)
+    out._b = _fraction(s.b)
+    out._c = _fraction(s.c)
     return out
 
 
@@ -205,12 +205,23 @@ cdef int _number_cmp(object a, object b) except -2:
 
 
 cdef object _richcmp_number(object self, object other, int op):
-    """Shared rich comparison for :class:`SqrtExtension` and :class:`Algebraic`."""
+    """Shared rich comparison for :class:`SqrtExtension` and :class:`Algebraic`.
+
+    A value that is not number-like at all yields ``NotImplemented`` so that ``==`` / ``!=``
+    fall back to identity and ordering raises the standard
+    ``TypeError: '<' not supported between instances of ...``.  A value that *looks* like a
+    number but cannot be parsed (``"abc"``) only degrades that way for ``==`` / ``!=``;
+    ordering re-raises the informative :class:`ValueError`.
+    """
     cdef int c
     try:
         c = _number_cmp(self, other)
     except TypeError:
         return NotImplemented
+    except ValueError:
+        if op == 2 or op == 3:
+            return NotImplemented
+        raise
     if op == 0:
         return c < 0
     if op == 1:
@@ -244,10 +255,26 @@ cdef class SqrtExtension:
     """
 
     cdef Geom g
-    # a, b, c are the exact coefficients as fractions.Fraction (value = a + b*sqrt(c)).
-    cdef readonly object a
-    cdef readonly object b
-    cdef readonly object c
+    # the exact coefficients as fractions.Fraction (value = a + b*sqrt(c));
+    # exposed read-only through the a / b / c properties below
+    cdef object _a
+    cdef object _b
+    cdef object _c
+
+    @property
+    def a(self):
+        """The rational part, a :class:`fractions.Fraction`."""
+        return self._a
+
+    @property
+    def b(self):
+        """The coefficient of the square root, a :class:`fractions.Fraction`."""
+        return self._b
+
+    @property
+    def c(self):
+        """The radicand ``c >= 0``, a :class:`fractions.Fraction`."""
+        return self._c
 
     def __cinit__(self, a=0, b=0, c=0):
         cdef SqrtExt s
@@ -257,9 +284,9 @@ cdef class SqrtExtension:
         if rational_sign(s.c) < 0:
             raise ValueError("SqrtExtension: the radicand c must be >= 0, got %r" % (c,))
         self.g = box_sqrt_ext(s)
-        self.a = _fraction(s.a)
-        self.b = _fraction(s.b)
-        self.c = _fraction(s.c)
+        self._a = _fraction(s.a)
+        self._b = _fraction(s.b)
+        self._c = _fraction(s.c)
 
     @property
     def approx(self):
@@ -318,7 +345,7 @@ cdef class SqrtExtension:
         return number_to_double(self.g)
 
     def __repr__(self):
-        return "SqrtExtension(%s, %s, %s)" % (self.a, self.b, self.c)
+        return "SqrtExtension(%s, %s, %s)" % (self._a, self._b, self._c)
 
     def __str__(self):
         cdef string s = number_repr(self.g)
@@ -336,7 +363,7 @@ cdef class SqrtExtension:
         """
         if not number_is_rational(self.g):
             raise TypeError(
-                "unhashable: SqrtExtension(%s, %s, %s) is irrational" % (self.a, self.b, self.c)
+                "unhashable: SqrtExtension(%s, %s, %s) is irrational" % (self._a, self._b, self._c)
             )
         return hash(_fraction(number_to_rational(self.g)))
 
@@ -344,7 +371,7 @@ cdef class SqrtExtension:
         return number_sign(self.g) != 0
 
     def __neg__(self):
-        return SqrtExtension(-self.a, -self.b, self.c)
+        return SqrtExtension(-self._a, -self._b, self._c)
 
 
 # ---------------------------------------------------------------------------

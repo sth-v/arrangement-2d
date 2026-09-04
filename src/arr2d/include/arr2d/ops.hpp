@@ -29,7 +29,7 @@ namespace arr2d {
 struct IntersectionResult {
   bool is_point = true;      ///< true: `point` + `multiplicity`; false: `overlap` (an x-monotone curve)
   Geom point;
-  unsigned multiplicity = 0; ///< 0 = unknown / not computed (as reported by the traits)
+  std::size_t multiplicity = 0; ///< as reported by the traits (0 = unknown / not computed; Bezier reports only 0/1)
   Geom overlap;
 };
 

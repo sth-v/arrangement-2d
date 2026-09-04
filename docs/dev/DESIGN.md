@@ -103,7 +103,7 @@ translates them: `PreconditionError` (subclass of `CGALError` and `ValueError`),
 `CGALAssertionError`, `PostconditionError`, `CGALWarning`; plus our own
 `InvalidHandleError`, `KindMismatchError` (TypeError), `NotXMonotoneError` (ValueError),
 `NotRepresentableError` (ValueError; e.g. algebraic point converted to a rational kind).
-CGAL preconditions stay **enabled** (we compile with `-UNDEBUG` after Python's flags).
+CGAL preconditions stay **enabled** (we compile with `-DNDEBUG -DCGAL_DEBUG`). Known CGAL 6.1 traps and the code-level responses are collected in `docs/dev/CGAL_TRAPS_CHECKLIST.md`.
 
 ## 2. C++ core interface (summary; the headers are the spec)
 
@@ -301,7 +301,7 @@ Convenience: `on_face=lambda fa, fb: value` etc. set `.data` of the result eleme
 
 `setup.py` (setuptools + Cython 3), single extension `arrangement_2d._core` built from
 `_core.pyx` + all `src/arr2d/src/*.cpp`, C++17, `-O2`, `-DCGAL_USE_CORE -DCGAL_USE_GMP -DCGAL_USE_MPFR`,
-`-UNDEBUG` (keep CGAL preconditions), `-fvisibility=hidden`, link `gmp`, `mpfr`.
+`-DNDEBUG -DCGAL_DEBUG` (C assert off, CGAL preconditions ON — see docs/dev/cgal61_api/build_and_abi_contract.md), `-fvisibility=hidden`, link `gmp`, `mpfr`.
 Include/lib discovery order: env `CGAL_DIR`/`CGAL_INCLUDE_DIR`/`GMP_DIR`..., `CONDA_PREFIX`,
 `brew --prefix` (macOS), `/usr/local`, `/usr`, `pkg-config gmp mpfr`. Parallel object compilation
 (`build_ext.parallel = cpu_count`). `pip install -e .` and `python setup.py build_ext --inplace -j16` both work.

@@ -97,8 +97,10 @@ def compile_args():
     if os.environ.get("ARR2D_NDEBUG") == "1":
         args += ["-DNDEBUG", "-DCGAL_NDEBUG"]
     else:
-        # Python's CFLAGS define NDEBUG which would silently disable CGAL preconditions. Keep them on.
-        args += ["-UNDEBUG"]
+        # Python's CFLAGS define NDEBUG, which would silently disable every CGAL precondition
+        # (CGAL misuse then corrupts memory instead of raising). -DCGAL_DEBUG re-enables the CGAL
+        # checks while leaving C assert() off (docs/dev/cgal61_api/build_and_abi_contract.md).
+        args += ["-DNDEBUG", "-DCGAL_DEBUG"]
     args += ["-fvisibility=hidden", "-fvisibility-inlines-hidden", "-Wno-unused-parameter",
              "-Wno-deprecated-declarations", "-Wno-unused-local-typedef", "-Wno-unused-function",
              "-Wno-unused-variable", "-Wno-unused-but-set-variable", "-Wno-unknown-warning-option",

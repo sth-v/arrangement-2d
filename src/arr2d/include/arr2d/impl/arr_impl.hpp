@@ -937,15 +937,23 @@ class ArrImpl final : public ArrBase {
 
     // CGAL::locate emits its results in increasing xy-lexicographic order of the query points
     // (point_location_and_decomposition.md §10), so re-establish the input order by sorting the
-    // input indices with the traits' Compare_xy_2 and zipping.
+    // input indices with the traits' Compare_xy_2 and merging.  NOTE: the sweep merges EQUAL
+    // query points into a single event, so there is one result per *distinct* point, not per
+    // query — matching by value (not by position) is required.  A query point for which CGAL
+    // emitted nothing keeps Located::none().
     std::vector<std::size_t> order(pts.size());
     std::iota(order.begin(), order.end(), std::size_t(0));
     const KindOps& o = ops();
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
       return o.point_compare_xy(pts[a], pts[b]) < 0;
     });
-    const std::size_t n = std::min(order.size(), res.size());
-    for (std::size_t k = 0; k < n; ++k) out[order[k]] = from_pl(res[k].second);
+    std::size_t i = 0;
+    for (std::size_t k = 0; k < res.size() && i < order.size(); ++k) {
+      Geom rp = box_point(res[k].first);
+      while (i < order.size() && o.point_compare_xy(pts[order[i]], rp) < 0) ++i;
+      Located loc = from_pl(res[k].second);
+      while (i < order.size() && o.point_compare_xy(pts[order[i]], rp) == 0) out[order[i++]] = loc;
+    }
   }
 
   void zone(const Geom& c, std::vector<Located>& out) override {

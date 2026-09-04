@@ -18,7 +18,9 @@ namespace arr2d {
 
 enum class NumberKind : int { Rational = 0, SqrtExt = 1, Algebraic = 2 };
 
-/// a + b * sqrt(c), with c >= 0. Used for _One_root_number coordinates (circle segments).
+/// a + b * sqrt(c). Invariant: c >= 0 (helpers throw Error(InvalidArgument) otherwise).
+/// Used for the Sqrt_extension coordinates of circle-segment points. Boxing helpers normalise:
+/// a provably rational value (b == 0, c == 0, or c a perfect square) is boxed as a Rational.
 struct SqrtExt {
   Rational a, b, c;
 };
@@ -37,17 +39,19 @@ bool rational_is_integer(const Rational& r);
 // ---- Boxed numbers ----
 Geom box_rational(const Rational& r);
 Geom box_sqrt_ext(const SqrtExt& s);
-/// Box a CORE::Expr (declared in the .cpp; callers in kind TUs use the template below).
-template <class T> Geom box_number(NumberKind nk, T value) { return make_geom(Kind::Segment, GeomType::Number, std::move(value)); }
+/// Low-level boxing: T must be exactly arr2d::Rational, arr2d::SqrtExt or CORE::Expr (number_kind()
+/// discriminates on the stored C++ type). Prefer box_rational / box_sqrt_ext here and
+/// box_epeck_ft / box_sqrt_extension / box_core_expr from impl/number_conv.hpp.
+template <class T> Geom box_number(NumberKind /*nk*/, T value) { return make_geom(Kind::Segment, GeomType::Number, std::move(value)); }
 
 NumberKind number_kind(const Geom& n);                    ///< throws unless n.type == Number
 double number_to_double(const Geom& n);
 /// Certified interval containing the value. For Algebraic numbers `bits` controls the
 /// requested relative precision (CORE refines on demand); ignored for the other kinds.
 std::pair<double, double> number_interval(const Geom& n, int bits = 53);
-bool number_is_rational(const Geom& n);                   ///< true if the exact value is known to be rational (Rational: always; SqrtExt: b==0 or c==0; Algebraic (CORE::Expr): always false — CORE offers no safe rationality test)
+bool number_is_rational(const Geom& n);                   ///< true if the exact value is known to be rational (Rational: always; SqrtExt: b==0, c==0 or c a perfect square; Algebraic (CORE::Expr): always false — CORE offers no safe rationality test)
 Rational number_to_rational(const Geom& n);               ///< throws NotRepresentable if not rational
-SqrtExt number_to_sqrt_ext(const Geom& n);                ///< throws unless kind == SqrtExt
+SqrtExt number_to_sqrt_ext(const Geom& n);                ///< SqrtExt box, or a Rational box as {r, 0, 0}; throws for Algebraic
 int number_sign(const Geom& n);
 int number_compare(const Geom& a, const Geom& b);         ///< same NumberKind required (or both convertible to rational); -1/0/1
 std::string number_repr(const Geom& n);                   ///< exact textual form when possible ("3/4", "1/2 + 3*sqrt(2)", or a CORE expression / decimal approximation)
