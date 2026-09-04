@@ -1,5 +1,30 @@
+[build-system]
+requires = ["setuptools>=70", "wheel", "Cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "arrangement-2d"
 version = "0.1.0"
-requires-python = ">=3.14"
+description = "Python bindings (Cython) for the CGAL 2D Arrangements package: segments, lines, circular arcs, polylines, Bézier curves, conics, geodesic arcs on the sphere; history, overlay, point location, Boolean set operations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "LGPL-3.0-or-later" }
 dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Cython",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+plot = ["matplotlib", "numpy"]
+test = ["pytest", "numpy"]
+
+[tool.setuptools]
+packages = ["arrangement_2d"]
+include-package-data = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

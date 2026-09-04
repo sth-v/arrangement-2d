@@ -224,3 +224,13 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+
+# --- arrangement_2d build artifacts ---
+build/
+dist/
+*.egg-info/
+arrangement_2d/_core.cpp
+arrangement_2d/*.so
+__pycache__/
+.pytest_cache/
+.idea/
