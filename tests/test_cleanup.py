@@ -69,6 +69,35 @@ def test_snap_removes_duplicates_and_degenerate():
     assert len(res.segments) == 4
 
 
+def test_snap_provenance_tracks_splits_reversed_duplicates_and_dropped_inputs():
+    # A reversed duplicate must retain BOTH source identities when the receiving
+    # edge is split at a near T-junction. A zero-length input has no descendants.
+    segs = [((0., 0.), (4., 0.)), ((4., 0.), (0., 0.)),
+            ((2., 1e-9), (2., 3.)), ((9., 9.), (9., 9.))]
+    res = cleanup.snap_segments(segs, tolerance=1e-6)
+    assert res.source_indices == [(0, 1), (0, 1), (2,)]
+    assert res.segments == [((0., 0.), (2., 1e-9)),
+                            ((2., 1e-9), (4., 0.)),
+                            ((2., 1e-9), (2., 3.))]
+
+
+def test_snap_provenance_merges_duplicates_created_in_later_iterations():
+    segs = [((0., 0.), (4., 0.)), ((2., 1e-9), (6., 1e-9))]
+    res = cleanup.snap_segments(segs, tolerance=1e-6)
+    assert len(res.segments) == 3
+    assert sorted(res.source_indices) == [(0,), (0, 1), (1,)]
+    assert res.removed_duplicates == 1
+
+
+def test_snap_provenance_keeps_original_indexes_after_early_drops():
+    segs = [((9., 9.), (9., 9.)), ((0., 0.), (4., 0.)),
+            ((4. + 1e-9, 0.), (4., 0.)), ((0., 0.), (0., 4.))]
+    res = cleanup.snap_segments(segs, tolerance=1e-6)
+    assert res.source_indices == [(1,), (3,)]
+    assert res.removed_degenerate == 2
+    assert cleanup.snap_segments([], tolerance=1e-6).source_indices == []
+
+
 def test_snap_is_idempotent_and_does_not_touch_clean_input():
     segs = square() + [((0.0, 0.0), (4.0, 4.0))]
     res = cleanup.snap_segments(segs, tolerance=1e-6)

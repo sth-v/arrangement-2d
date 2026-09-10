@@ -6564,10 +6564,15 @@ Overlapping, collinear segments are *not* merged here: after snapping their endp
 onto each other they overlap exactly, and the exact arrangement merges exact overlaps
 into single edges by itself.
 
+``result.source_indices[i]`` identifies the original input segments contributing
+to ``result.segments[i]``, including after repeated splitting and deduplication.
+This can be combined with the arrangement's curve history to preserve source
+metadata on the final atomic edges.
+
 ### `SnapResult`
 
 ```python
-SnapResult(segments: list[SegmentT], iterations: int, endpoints_merged: int, t_junctions_snapped: int, removed_degenerate: int, removed_duplicates: int) -> None
+SnapResult(segments: list[SegmentT], iterations: int, endpoints_merged: int, t_junctions_snapped: int, removed_degenerate: int, removed_duplicates: int, source_indices: list[tuple[int, ...]] = <factory>) -> None
 ```
 
 Result of `snap_segments`.

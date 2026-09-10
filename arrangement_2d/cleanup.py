@@ -229,6 +229,11 @@ class SnapResult:
     t_junctions_snapped: int
     removed_degenerate: int
     removed_duplicates: int
+    #: For each output segment, the sorted original input indexes that contributed
+    #: to it. Splits inherit their parent's indexes; duplicates combine them.
+    #: Degenerate inputs have no descendants. Indexes refer to the input iterable
+    #: before any cleanup, including its duplicate and zero-length entries.
+    source_indices: list[tuple[int, ...]] = field(default_factory=list)
 
     def __str__(self) -> str:
         return (f"{len(self.segments)} segments after {self.iterations} iteration(s): "
@@ -242,18 +247,18 @@ def _cluster_endpoints(S: np.ndarray, tol: float) -> tuple[np.ndarray, int]:
     uf = _UnionFind(len(P))
     for i, j in _grid_pairs_within(P, tol):
         uf.union(i, j)
-    roots = np.array([uf.find(i) for i in range(len(P))])
+    roots = np.array([uf.find(i) for i in range(len(P))], dtype=np.intp)
     Pn = P[roots]
     merged = int(np.any(Pn != P, axis=1).sum())   # endpoints that actually MOVED (coincident points do not count)
     n = len(S)
     return np.hstack([Pn[:n], Pn[n:]]), merged
 
 
-def _snap_to_edges(S: np.ndarray, tol: float) -> tuple[np.ndarray, int]:
+def _snap_to_edges(S: np.ndarray, tol: float, sources: list[tuple[int, ...]]) -> tuple[np.ndarray, int, list[tuple[int, ...]]]:
     """Split every segment at the endpoints (of other segments) that lie within ``tol`` of its interior."""
     P = np.unique(np.vstack([S[:, :2], S[:, 2:]]), axis=0)
     if len(P) == 0:
-        return S, 0
+        return S, 0, sources
     lo, hi = P.min(0), P.max(0)
     extent = float(max(hi[0] - lo[0], hi[1] - lo[1], tol))
     cell = max(tol * 4.0, extent / 1024.0)
@@ -262,15 +267,17 @@ def _snap_to_edges(S: np.ndarray, tol: float) -> tuple[np.ndarray, int]:
     for i, c in enumerate(map(tuple, cells)):
         buckets.setdefault(c, []).append(i)
     out_rows: list[tuple[float, float, float, float]] = []
+    out_sources: list[tuple[int, ...]] = []
     snapped = 0
     tol2 = tol * tol
-    for row in S:
+    for row, origin in zip(S, sources):
         a = row[:2]
         b = row[2:]
         ab = b - a
         l2 = float(ab @ ab)
         if l2 == 0:
             out_rows.append(tuple(row))
+            out_sources.append(origin)
             continue
         cmin = np.floor((np.minimum(a, b) - tol - lo) / cell).astype(np.int64)
         cmax = np.floor((np.maximum(a, b) + tol - lo) / cell).astype(np.int64)
@@ -291,6 +298,7 @@ def _snap_to_edges(S: np.ndarray, tol: float) -> tuple[np.ndarray, int]:
                         hits.append((t, p))
         if not hits:
             out_rows.append(tuple(row))
+            out_sources.append(origin)
             continue
         hits.sort(key=lambda h: h[0])
         # a vertex may hit the same segment through several grid cells: keep each point once
@@ -303,25 +311,30 @@ def _snap_to_edges(S: np.ndarray, tol: float) -> tuple[np.ndarray, int]:
         for u, v in zip(chain, chain[1:]):
             if not (u[0] == v[0] and u[1] == v[1]):
                 out_rows.append((float(u[0]), float(u[1]), float(v[0]), float(v[1])))
+                out_sources.append(origin)
         snapped += len(hits)
-    return np.asarray(out_rows, dtype=float).reshape(-1, 4), snapped
+    return np.asarray(out_rows, dtype=float).reshape(-1, 4), snapped, out_sources
 
 
-def _dedupe(S: np.ndarray) -> tuple[np.ndarray, int, int]:
+def _dedupe(S: np.ndarray, sources: list[tuple[int, ...]]) -> tuple[np.ndarray, int, int, list[tuple[int, ...]]]:
     keep: list[tuple[float, float, float, float]] = []
-    seen: set[tuple] = set()
+    kept_sources: list[tuple[int, ...]] = []
+    seen: dict[tuple, int] = {}
     degenerate = dup = 0
-    for x1, y1, x2, y2 in S.tolist():
+    for (x1, y1, x2, y2), origin in zip(S.tolist(), sources):
         if x1 == x2 and y1 == y2:
             degenerate += 1
             continue
         key = ((x1, y1), (x2, y2)) if (x1, y1) <= (x2, y2) else ((x2, y2), (x1, y1))
         if key in seen:
             dup += 1
+            index = seen[key]
+            kept_sources[index] = tuple(sorted(set(kept_sources[index]).union(origin)))
             continue
-        seen.add(key)
+        seen[key] = len(keep)
         keep.append((x1, y1, x2, y2))
-    return np.asarray(keep, dtype=float).reshape(-1, 4), degenerate, dup
+        kept_sources.append(origin)
+    return np.asarray(keep, dtype=float).reshape(-1, 4), degenerate, dup, kept_sources
 
 
 def snap_segments(segments: Iterable[Any], tolerance: float, *, snap_endpoints: bool = True,
@@ -337,11 +350,17 @@ def snap_segments(segments: Iterable[Any], tolerance: float, *, snap_endpoints: 
     Overlapping, collinear segments are *not* merged here: after snapping their endpoints
     onto each other they overlap exactly, and the exact arrangement merges exact overlaps
     into single edges by itself.
+
+    ``result.source_indices[i]`` identifies the original input segments contributing
+    to ``result.segments[i]``, including after repeated splitting and deduplication.
+    This can be combined with the arrangement's curve history to preserve source
+    metadata on the final atomic edges.
     """
     if tolerance <= 0:
         raise ValueError("tolerance must be positive")
     S = _as_segment_array(segments)
-    S, degenerate, dup = _dedupe(S)
+    sources = [(i,) for i in range(len(S))]
+    S, degenerate, dup, sources = _dedupe(S, sources)
     merged_total = snapped_total = 0
     it = 0
     for it in range(1, max_iterations + 1):
@@ -353,18 +372,19 @@ def snap_segments(segments: Iterable[Any], tolerance: float, *, snap_endpoints: 
                 merged_total += merged
                 S = S2
         if snap_to_edges:
-            S2, snapped = _snap_to_edges(S, tolerance)
+            S2, snapped, split_sources = _snap_to_edges(S, tolerance, sources)
             if snapped:
                 changed = True
                 snapped_total += snapped
                 S = S2
-        S, d, u = _dedupe(S)
+                sources = split_sources
+        S, d, u, sources = _dedupe(S, sources)
         degenerate += d
         dup += u
         if not changed:
             break
     segs = [((r[0], r[1]), (r[2], r[3])) for r in S.tolist()]
-    return SnapResult(segs, it, merged_total, snapped_total, degenerate, dup)
+    return SnapResult(segs, it, merged_total, snapped_total, degenerate, dup, sources)
 
 
 # ---------------------------------------------------------------------------

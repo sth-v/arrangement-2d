@@ -790,6 +790,26 @@ print([regions.face_area(face) for face in regions.bounded_faces(arr)])   # [Fra
   faces.
 * `clean_arrangement(segs, tolerance)` is the three steps in one call.
 
+When input segments carry zone IDs or other metadata, retain the `SnapResult`:
+`result.source_indices[i]` is the tuple of original input indexes contributing to
+`result.segments[i]`. Splitting copies the source indexes, deduplication combines
+them (including reversed duplicates), and collapsed inputs have no descendants.
+The indexes always refer to the original iterable, before any cleanup.
+
+```python
+snapped = cleanup.snap_segments(segs, tolerance=1e-6)
+arr = a2.Arrangement("segment")
+handles = arr.insert([a2.Segment(*s) for s in snapped.segments])
+sources = {h.id: ids for h, ids in zip(handles, snapped.source_indices)}
+cleanup.remove_dangling_edges(arr)
+for edge in arr.edges():
+    edge.data = {"source_indices": sorted({i for h in edge.originating_curves()
+                                          for i in sources[h.id]})}
+```
+
+`source_indices` records ancestry, not orientation: compare the final directed
+edge with its original segment before assigning left/right metadata.
+
 On a real 4965-segment CAD drawing (`tst.json` in the repository) the exact arrangement
 finds 4 of the 10 building outlines; after `clean_arrangement(..., tolerance=1e-2)` all
 10 are closed faces and the bounded area more than doubles:
