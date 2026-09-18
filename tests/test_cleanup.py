@@ -1,5 +1,7 @@
 """Tests for arrangement_2d.cleanup (tolerance-based snapping before the exact arrangement)."""
 import pytest
+from fractions import Fraction
+import numpy as np
 
 a2 = pytest.importorskip("arrangement_2d")
 from arrangement_2d import cleanup, regions  # noqa: E402
@@ -60,6 +62,30 @@ def test_snap_closes_t_junction_and_splits_the_edge():
     arr = a2.Arrangement("segment"); arr.insert([a2.Segment(p, q) for p, q in res.segments])
     assert len(bounded_faces(arr)) == 2
     assert sorted(float(regions.face_area(f)) for f in bounded_faces(arr)) == pytest.approx([8.0, 8.0], abs=1e-6)
+
+
+def test_zero_float_projection_distance_is_not_exact_incidence():
+    a, b, p = (0.1, 0.3), (1.7, 2.9), (0.26, 0.56)
+    aa, bb, pp = map(np.asarray, (a, b, p))
+    ab = bb - aa
+    t = float((pp - aa) @ ab / (ab @ ab))
+    assert np.array_equal(pp, aa + t * ab)
+    ax, ay, bx, by, px, py = map(Fraction, (*a, *b, *p))
+    assert (bx - ax) * (py - ay) - (by - ay) * (px - ax) != 0
+    result = cleanup.snap_segments([(a, b), (p, (0., 1.))], tolerance=1e-6)
+    assert result.segments == [(a, p), (p, b), (p, (0., 1.))]
+    assert result.source_indices == [(0,), (0,), (1,)]
+    assert result.t_junctions_snapped == 1
+    repeated = cleanup.snap_segments(result.segments, tolerance=1e-6)
+    assert repeated.segments == result.segments
+    assert repeated.t_junctions_snapped == 0
+
+
+def test_exact_interior_incidence_remains_for_cgal_without_cleanup_split():
+    segments = [((0., 0.), (2., 2.)), ((1., 1.), (0., 2.))]
+    result = cleanup.snap_segments(segments, tolerance=1e-6)
+    assert result.segments == segments
+    assert result.t_junctions_snapped == 0
 
 
 def test_snap_removes_duplicates_and_degenerate():

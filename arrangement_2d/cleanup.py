@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -294,7 +295,16 @@ def _snap_to_edges(S: np.ndarray, tol: float, sources: list[tuple[int, ...]]) ->
                     proj = a + t * ab
                     d = p - proj
                     d2 = d[0] * d[0] + d[1] * d[1]
-                    if 0.0 < d2 <= tol2:          # exact incidences are left to the arrangement
+                    if d2 <= tol2:
+                        if d2 == 0.0:
+                            # A floating projection may round back to p even
+                            # though the input doubles are NOT collinear as
+                            # exact rationals. CGAL sees that residual gap.
+                            # Leave only genuinely exact incidences to CGAL.
+                            ax, ay, bx, by, px, py = map(
+                                Fraction, map(float, (*a, *b, *p)))
+                            if (bx - ax) * (py - ay) == (by - ay) * (px - ax):
+                                continue
                         hits.append((t, p))
         if not hits:
             out_rows.append(tuple(row))
